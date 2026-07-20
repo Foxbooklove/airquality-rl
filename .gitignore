@@ -1,0 +1,17 @@
+﻿# data
+data/raw/
+data/processed/
+
+# secrets
+.env
+configs/secrets.*
+
+# python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# os
+.DS_Store
