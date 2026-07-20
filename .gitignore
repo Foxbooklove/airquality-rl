@@ -15,3 +15,6 @@ venv/
 
 # os
 .DS_Store
+
+# results
+results/
