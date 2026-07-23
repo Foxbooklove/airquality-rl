@@ -26,6 +26,8 @@ class ModelConfig:
     # --- Sampled MuZero 탐색 ---
     num_sampled_actions: int = 8   # K: 노드마다 뽑는 행동 수
     num_simulations: int = 24      # MCTS 시뮬 횟수
+    root_explore_std: float = 0.5  # 루트 탐색 노이즈 (0이면 끔).
+                                   # 정책이 한 방향으로 굳는 것 방지
     pb_c_base: float = 19652.0
     pb_c_init: float = 1.25
     discount: float = 0.997

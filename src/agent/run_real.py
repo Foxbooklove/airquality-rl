@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 import numpy as np
 import torch
@@ -33,12 +34,17 @@ from src.data.preprocess import AirQualityPreprocessor
 ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------- SETTINGS ----------------
-REGION = "서울특별시"
+REGION = None              # None=전국, "서울특별시" 등=해당 시도만
 RESOLUTION = 60            # Kriging 격자 (크면 정확·느림)
 SNAPSHOT_DT = "2024-07-01 13:00"
 POLLUTANT = "PM10"
 VISIBLE_RATIO = 0.4       # A(초기 가시 측정소) 비율 — 낮을수록 드론 여지 큼
-EPISODES = 40
+BBOX_PAD = None           # None=필터 없음(전국 측정소 전부). 숫자=캔버스 주변만 컷
+TTL = 40                  # 드론 이동 예산(스텝 수). 넉넉하게.
+MAX_STEP_FRAC = 0.06      # 스텝당 최대 이동거리 = 캔버스 대각선의 이 비율.
+                          # 캔버스가 커지면 줄여야 함(전국이면 0.25는 한 스텝에 200km)
+EPISODES = 300            # MuZero는 짧으면 학습 전에 끝남. 길게.
+CKPT_EVERY = 25           # 이 주기마다 모델+학습곡선 저장 (중간에 끊겨도 보존)
 
 
 def run_episode(net, cfg, env, greedy=True, random_policy=False):
@@ -62,7 +68,8 @@ def run_episode(net, cfg, env, greedy=True, random_policy=False):
 
 
 def main():
-    mcfg = ModelConfig(grid_size=16, num_simulations=30, max_battery=12)
+    mcfg = ModelConfig(grid_size=16, num_simulations=30, max_battery=TTL,
+                       max_step_frac=MAX_STEP_FRAC)
     tcfg = TrainConfig(lr=1e-3, seed=0)
     torch.manual_seed(tcfg.seed); np.random.seed(tcfg.seed)
 
@@ -73,12 +80,17 @@ def main():
     print(f"         측정소 {len(snap)}개, 육지칸 {int(canvas.land_mask.sum())}")
 
     env = AirQualityEnv(canvas, snap, mcfg, pollutant=POLLUTANT,
-                        visible_ratio=VISIBLE_RATIO, seed=tcfg.seed)
+                        visible_ratio=VISIBLE_RATIO, bbox_pad=BBOX_PAD,
+                        seed=tcfg.seed)
+    print(f"         사용 측정소 {env.n_stations}개 (가시 A={len(env.visible_idx)}개), "
+          f"TTL={TTL}")
     net = MuZeroNet(mcfg)
     opt = torch.optim.Adam(net.parameters(), lr=tcfg.lr)
 
     # --- 학습 ---
+    out = ROOT / "results"; out.mkdir(exist_ok=True)
     gains = []
+    t0 = time.time()
     for ep in range(EPISODES):
         traj = self_play(net, mcfg, env)
         total, parts = compute_losses(net, mcfg, traj)
@@ -87,21 +99,44 @@ def main():
         opt.step()
         g = sum(s["reward"] for s in traj)
         gains.append(g)
-        if ep % 5 == 0 or ep == EPISODES - 1:
-            print(f"  ep {ep:3d} | info_gain={g:.3f} | loss={float(total.detach()):.3f}")
 
-    # --- 데모 + baseline ---
-    learned_gain, traj, var0, var1 = run_episode(net, mcfg, env)
-    random_gain, *_ = run_episode(net, mcfg, env, random_policy=True)
-    print(f"[결과] 학습 정책 info_gain={learned_gain:.3f} | 랜덤={random_gain:.3f}")
+        if ep % 5 == 0 or ep == EPISODES - 1:
+            el = time.time() - t0
+            eta = el / (ep + 1) * (EPISODES - ep - 1)
+            # 최근 10 에피소드 이동평균 — 단일 에피소드는 편차가 커서 추세가 안 보임
+            ma = float(np.mean(gains[-10:]))
+            print(f"  ep {ep:3d} | info_gain={g:.3f} (최근10 평균 {ma:.3f}) | "
+                  f"loss={float(total.detach()):.3f} | ETA {eta/60:.1f}분")
+
+        if CKPT_EVERY and (ep + 1) % CKPT_EVERY == 0:
+            torch.save(net.state_dict(), out / "proto_muzero_ckpt.pt")
+            np.save(out / "proto_gains.npy", np.array(gains))
+            viz.learning_curve(gains, out / "proto_learning_curve.png")
+
+    # --- 데모 + baseline (반복 측정: 시작 위치 무작위라 단일 시행은 편차 큼) ---
+    N_EVAL = 10
+    learned_runs, random_runs = [], []
+    demo = None
+    for i in range(N_EVAL):
+        g, tr, v0, v1 = run_episode(net, mcfg, env)
+        learned_runs.append(g)
+        if demo is None or g > demo[0]:
+            demo = (g, tr, v0, v1)          # 가장 좋은 궤적을 지도용으로
+        gr, *_ = run_episode(net, mcfg, env, random_policy=True)
+        random_runs.append(gr)
+    learned_gain, traj, var0, var1 = demo
+    lm, ls = float(np.mean(learned_runs)), float(np.std(learned_runs))
+    rm, rs = float(np.mean(random_runs)), float(np.std(random_runs))
+    print(f"[결과] {N_EVAL}회 평균 — 학습 {lm:.3f}±{ls:.3f} | 랜덤 {rm:.3f}±{rs:.3f}")
+    print(f"       지도용 데모 궤적 info_gain={learned_gain:.3f}")
 
     # --- figure 저장 ---
-    out = ROOT / "results"; out.mkdir(exist_ok=True)
     extent = [canvas.min_lon, canvas.max_lon, canvas.min_lat, canvas.max_lat]
     viz.uncertainty_before_after(var0, var1, traj, canvas.land_mask,
                                  out / "proto_uncertainty.png", extent=extent)
     viz.learning_curve(gains, out / "proto_learning_curve.png")
-    viz.baseline_compare(learned_gain, random_gain, out / "proto_baseline.png")
+    viz.baseline_compare(lm, rm, out / "proto_baseline.png",
+                         learned_std=ls, random_std=rs, n=N_EVAL)
 
     # folium HTML 지도 (실제 지도 위 무작위 시작 -> 드론 경로 + 불확실성 오버레이)
     vis_idx = env.visible_idx

@@ -1,0 +1,11 @@
+torch
+pykrige
+folium
+branca
+matplotlib
+geopandas
+pandas
+numpy
+requests
+pyarrow
+openpyxl

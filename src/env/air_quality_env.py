@@ -28,7 +28,8 @@ class AirQualityEnv:
     def __init__(self, canvas, snapshot, cfg: ModelConfig,
                  pollutant: str = "PM10", visible_ratio: float = 0.5,
                  value_scale: float = 100.0, reward_fn: RewardFn | None = None,
-                 random_start: bool = True, seed: int = 0):
+                 random_start: bool = True, bbox_pad: float | None = None,
+                 seed: int = 0):
         """
         canvas   : Canvas (min/max lon·lat, resolution, grid_lon/lat, land_mask)
         snapshot : DataFrame [station, lat, lon, <pollutant>]  (get_snapshot 결과)
@@ -48,6 +49,18 @@ class AirQualityEnv:
 
         # 전체 스냅샷 = 시뮬레이터의 '진짜 농도장' (드론 측정값 생성용)
         s = snapshot.dropna(subset=[pollutant]).reset_index(drop=True)
+        # bbox_pad=None 이면 필터 없음(전국 측정소 전부 사용).
+        # 농도장은 행정구역을 안 따르므로 캔버스 밖 측정소도 경계 추정에 유용.
+        # 숫자를 주면 캔버스 bbox + 그 비율만큼 여유를 둔 범위로 컷.
+        if bbox_pad is not None:
+            pad = bbox_pad * max(canvas.max_lon - canvas.min_lon,
+                                 canvas.max_lat - canvas.min_lat)
+            s = s[(s["lon"] >= canvas.min_lon - pad) & (s["lon"] <= canvas.max_lon + pad) &
+                  (s["lat"] >= canvas.min_lat - pad) & (s["lat"] <= canvas.max_lat + pad)]
+            s = s.reset_index(drop=True)
+        if len(s) < 5:
+            raise ValueError(f"사용 가능한 측정소가 너무 적음: {len(s)}개")
+        self.n_stations = len(s)
         self.st_lon = s["lon"].to_numpy(float)
         self.st_lat = s["lat"].to_numpy(float)
         self.st_val = s[pollutant].to_numpy(float)
@@ -80,7 +93,10 @@ class AirQualityEnv:
         theta = float(action[0]) * np.pi                       # [-1,1]->[-pi,pi]
         span = np.hypot(self.canvas.max_lon - self.canvas.min_lon,
                         self.canvas.max_lat - self.canvas.min_lat)
-        dist = float(action[1]) * self.cfg.max_step_frac * span
+        # 배터리 하드 제약: 남은 비율만큼만 이동 가능 (샘플러에서 여기로 이동 —
+        # 샘플러는 log-prob 역변환을 위해 '정규 공간' 행동만 다뤄야 함)
+        max_reach = min(1.0, self.battery / max(self.cfg.max_battery, 1e-6))
+        dist = float(action[1]) * self.cfg.max_step_frac * span * max_reach
 
         d = self.drones[0]
         lon = np.clip(d["lon"] + dist * np.cos(theta),

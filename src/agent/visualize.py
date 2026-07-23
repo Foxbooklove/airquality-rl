@@ -52,13 +52,20 @@ def learning_curve(info_gains, out_path: Path):
     plt.close(fig)
 
 
-def baseline_compare(learned_gain, random_gain, out_path: Path):
+def baseline_compare(learned, random_, out_path: Path,
+                     learned_std: float = 0.0, random_std: float = 0.0,
+                     n: int | None = None):
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.bar(["random", "learned (MuZero)"], [random_gain, learned_gain],
+    ax.bar(["random", "learned (MuZero)"], [random_, learned],
+           yerr=[random_std, learned_std], capsize=6,
            color=["#B4B2A9", "#1D9E75"])
-    ax.set_ylabel("total info gain (one episode)")
-    ax.set_title("Learned policy vs random baseline")
-    for i, v in enumerate([random_gain, learned_gain]):
+    ax.set_ylabel("total info gain (frac. of uncertainty removed)")
+    title = "Learned policy vs random baseline"
+    if n:
+        title += f"  (mean ± sd, n={n})"
+    ax.set_title(title)
+    for i, v in enumerate([random_, learned]):
         ax.text(i, v, f"{v:.3f}", ha="center", va="bottom")
+    ax.grid(axis="y", alpha=0.3)
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)

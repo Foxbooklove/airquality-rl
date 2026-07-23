@@ -1,20 +1,22 @@
-﻿# data
+# 데이터 (용량 큼, 직접 준비)
 data/raw/
 data/processed/
 
-# secrets
-.env
+# 인증키
+configs/secrets.py
 configs/secrets.*
 
-# python
+# 결과물
+results/
+
+# Python
 __pycache__/
-*.py[cod]
-.ipynb_checkpoints/
+*.pyc
+*.pyo
 .venv/
 venv/
+.ipynb_checkpoints/
 
-# os
+# OS
 .DS_Store
-
-# results
-results/
+Thumbs.db

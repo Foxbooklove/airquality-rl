@@ -40,13 +40,14 @@ class SampledMuZeroMCTS:
         self.sampler = ContinuousActionSampler(cfg)
 
     @torch.no_grad()
-    def run(self, obs, battery: float):
+    def run(self, obs, battery: float, return_root: bool = False):
         """루트 관측에서 탐색 -> (샘플 행동들, 방문수, beta_logprob, 루트가치).
-        방문수/beta 로 sampling.is_corrected_policy_target 을 부르면 학습 타깃."""
+        방문수/beta 로 sampling.is_corrected_policy_target 을 부르면 학습 타깃.
+        return_root=True 면 루트 Node 도 함께 반환(트리 시각화/디버깅용)."""
         s0, policy_params, _ = self.net.initial_inference(obs)
         root = Node(prior=1.0)
         root.latent = s0
-        self._expand(root, policy_params, battery)
+        self._expand(root, policy_params, battery, explore=True)
 
         for _ in range(self.cfg.num_simulations):
             node = root
@@ -74,11 +75,15 @@ class SampledMuZeroMCTS:
 
         visit_counts = torch.tensor(
             [c.visit_count for c in root.children], dtype=torch.float32)
+        if return_root:
+            return root.actions, visit_counts, root.beta_logprob, root.value(), root
         return root.actions, visit_counts, root.beta_logprob, root.value()
 
-    def _expand(self, node: Node, policy_params, battery: float):
+    def _expand(self, node: Node, policy_params, battery: float,
+                explore: bool = False):
         actions, beta_logprob = self.sampler.sample(
-            _unbatch(policy_params), battery)
+            _unbatch(policy_params), battery,
+            explore_std=self.cfg.root_explore_std if explore else 0.0)
         node.actions = actions
         node.beta_logprob = beta_logprob
         node.children = [Node(prior=1.0 / len(actions)) for _ in actions]

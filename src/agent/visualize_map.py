@@ -43,7 +43,8 @@ def trajectory_map(st_lon, st_lat, st_val, traj_lonlat, var, land,
     """
     min_lon, min_lat, max_lon, max_lat = bounds
     center = [(min_lat + max_lat) / 2, (min_lon + max_lon) / 2]
-    m = folium.Map(location=center, zoom_start=11, tiles="CartoDB positron")
+    m = folium.Map(location=center, tiles="CartoDB positron")
+    m.fit_bounds([[min_lat, min_lon], [max_lat, max_lon]])   # 캔버스 크기에 자동 맞춤
 
     # --- 불확실성 오버레이 (토글 레이어) ---
     overlay_dir = overlay_dir or out_html.parent
