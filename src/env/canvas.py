@@ -89,7 +89,7 @@ if __name__ == "__main__":
     plt.legend()
     plt.title("Canvas land mask (전국)")
 
-    out = ROOT / "results" / "canvas_mask_korea.png"
+    out = ROOT / "results" / "exploration" / "canvas_mask_korea.png"
     out.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out, dpi=120, bbox_inches="tight")
     print(f"저장: {out}")

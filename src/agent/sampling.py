@@ -70,17 +70,68 @@ class ContinuousActionSampler:
         return Normal(mean, log_std.exp())
 
     def sample(self, policy_params, battery: float = None,
-               explore_std: float = 0.0):
-        """K개 행동(정규 공간) + 각 행동의 제안분포 log-prob(beta) 반환.
+               explore_std: float = 0.0, validate=None, fallback=None,
+               max_rounds: int = 4):
+        """K개 행동(정규 공간) + 각 행동의 제안분포 log-prob(beta) + 통계 반환.
+
         battery 인자는 하위호환용으로 받되 사용 안 함 — 이동거리 제한은
-        env.step 에서 적용(역변환 가능하게)."""
+        env.step 에서 적용(역변환 가능하게).
+
+        마스킹 (바다 비행 / 경계 이탈 금지):
+          validate : callable(actions[N,2]) -> bool mask[N].
+                     기하 판정은 호출자(mcts)가 한다 — 이 모듈은 분포만 안다.
+          fallback : callable() -> action[2]. 유효 후보가 0개일 때 쓸 보증된 한 수.
+
+        연속 가우시안이라 로짓을 -inf 로 미는 방식이 불가하므로 **기각 샘플링**을
+        쓴다. 결과는 정책분포를 유효 영역으로 절단한 것과 동등하다.
+
+        IS 보정은 깨지지 않는다: 절단분포는 q(a)/Z 이고 Z 는 이 노드의 모든
+        샘플에 동일한 상수라, is_corrected_policy_target 의 log 공간 softmax 와
+        losses 의 log_softmax 에서 모두 상쇄된다.
+
+        fallback 을 유효 후보와 **섞지 않는** 것이 중요하다. 폴백 행동(제자리)은
+        제안분포의 극단 꼬리라 beta_logprob 이 -12 수준이고, 섞으면
+        log(N) - beta 가 폭발해 IS 보정 질량을 100% 독식한다(측정 확인).
+        여기서는 유효 후보가 0개일 때만 쓰므로 후보 집합 크기가 1이 되고,
+        그러면 losses 의 log_softmax 가 정확히 0이라 **정책 손실이 0**이 된다
+        — 폴백 스텝은 정책 그래디언트를 아예 만들지 않아 자동으로 안전하다.
+        (가치·보상 손실은 정상 적용된다. 그 전이는 실제로 일어났으므로 맞다.)
+        """
         K = self.cfg.num_sampled_actions
         dist_n = self._dist(policy_params, explore_std)
-        u = dist_n.sample((K,))                      # [K, action_dim]
-        actions = _squash(u)                         # [K, 2] in (-1,1)x(0,1)
-        beta_logprob = _squashed_logprob(dist_n, u)  # [K]
-        # TODO: 비행금지 구역 마스킹은 env 의 land_mask/no-fly 로 여기서 추가.
-        return actions, beta_logprob
+
+        if validate is None:                          # 마스킹 없음 = 기존 동작
+            u = dist_n.sample((K,))                   # [K, action_dim]
+            return (_squash(u), _squashed_logprob(dist_n, u),
+                    {"draws": K, "rejected": 0, "fallback": False, "n_valid": K})
+
+        kept, n_drawn, n_rej = [], 0, 0
+        for _ in range(max_rounds):
+            u = dist_n.sample((4 * K,))               # 넉넉히 뽑아 기각
+            ok = np.asarray(validate(_squash(u)), dtype=bool)
+            n_drawn += len(u)
+            n_rej += int((~ok).sum())
+            if ok.any():
+                kept.append(u[torch.as_tensor(ok)])
+            if sum(len(t) for t in kept) >= K:
+                break
+
+        used_fallback = False
+        if kept:
+            u = torch.cat(kept, dim=0)[:K]             # 앞에서 K개 (iid 이므로 무편향)
+        else:
+            # 사방이 막힘 — 호출자가 준 보증된 한 수로 대체
+            if fallback is None:
+                raise RuntimeError(
+                    "유효 후보가 0개인데 fallback 이 없습니다. "
+                    "mcts 가 fallback 을 넘겨야 합니다.")
+            used_fallback = True
+            u = _unsquash(torch.as_tensor(fallback(), dtype=torch.float32)
+                          ).unsqueeze(0)               # [1, action_dim]
+
+        return (_squash(u), _squashed_logprob(dist_n, u),
+                {"draws": n_drawn, "rejected": n_rej, "fallback": used_fallback,
+                 "n_valid": len(u)})
 
     def network_logprob(self, policy_params, actions: torch.Tensor) -> torch.Tensor:
         """학습 시: 현재 네트워크가 (저장된) 샘플 행동들에 부여하는 log-prob."""

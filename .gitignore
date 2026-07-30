@@ -9,6 +9,10 @@ configs/secrets.*
 # 결과물
 results/
 
+# 외부 바이너리 (직접 내려받음, 52MB — 레포에 넣지 않는다)
+cloudflared.exe
+*.exe
+
 # Python
 __pycache__/
 *.pyc

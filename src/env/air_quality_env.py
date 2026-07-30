@@ -6,8 +6,12 @@
   - 관측: 드론 위치가 '농도장의 어느 지점을 여느냐'만 결정
 
 belief = Kriging(관측점들) 의 (mean, variance).
-정보이득 reward = 드론이 한 점 측정 -> Kriging 재계산 -> 육지 칸 분산 총합 감소분.
+기본 reward = 정보이득 = 드론이 한 점 측정 -> Kriging 재계산 -> 육지 칸 분산 총합 감소분.
 (분산 감소는 측정값과 무관, 위치만으로 결정 — 그래서 정답 C 없이 계산됨)
+
+reward_fn 을 주면 그쪽이 우선한다. env 는 before/after belief 를 모두 들고 있으므로
+(mean_prev/var_prev vs mean/var) 복합 보상이 임의의 지표를 계산할 수 있다.
+호흡기 위험도 가중 등은 src/env/rewards.py 의 CompositeReward 참고.
 
 상태는 '드론 축'을 열어둠(num_drones=1). belief 는 드론 수와 무관한 공유 자원.
 나중에 다중 드론이면 drones 를 N개로 늘리고 obs 의 drone 축만 확장.
@@ -21,6 +25,7 @@ import torch
 from pykrige.ok import OrdinaryKriging
 
 from src.agent.config import ModelConfig
+from src.env import motion
 from src.env.dummy_env import Observation, RewardFn
 
 
@@ -29,7 +34,7 @@ class AirQualityEnv:
                  pollutant: str = "PM10", visible_ratio: float = 0.5,
                  value_scale: float = 100.0, reward_fn: RewardFn | None = None,
                  random_start: bool = True, bbox_pad: float | None = None,
-                 seed: int = 0):
+                 seed: int = 0, flight_mask=None):
         """
         canvas   : Canvas (min/max lon·lat, resolution, grid_lon/lat, land_mask)
         snapshot : DataFrame [station, lat, lon, <pollutant>]  (get_snapshot 결과)
@@ -46,6 +51,13 @@ class AirQualityEnv:
         self.gx = canvas.grid_lon[0, :]       # [res]
         self.gy = canvas.grid_lat[:, 0]       # [res]
         self.land = np.asarray(canvas.land_mask, dtype=bool)   # [res, res]
+        self.extent = (canvas.min_lon, canvas.max_lon,
+                       canvas.min_lat, canvas.max_lat)
+        # 바다 횡단을 막으면 드론은 시작한 육지 덩어리에 갇힌다. 시작 위치를
+        # 본토(최대 연결 성분)로 제한하지 않으면 제주·섬에서 시작해 그 안에서만
+        # 맴도는 에피소드가 섞인다.
+        self.flight_mask = flight_mask
+        self._start_pool = None               # 시작 위치 후보 캐시 (첫 reset 에서 계산)
 
         # 전체 스냅샷 = 시뮬레이터의 '진짜 농도장' (드론 측정값 생성용)
         s = snapshot.dropna(subset=[pollutant]).reset_index(drop=True)
@@ -86,27 +98,34 @@ class AirQualityEnv:
         self.mean, self.var = self._krige(
             np.array(self.obs_lon), np.array(self.obs_lat), np.array(self.obs_val))
         self.var0 = max(float(self.var[self.land].sum()), 1e-9)  # 정규화 기준
+        # 직전 스텝 belief — RewardFn 이 before/after 를 모두 봐야 하므로 env 가 들고 있는다
+        self.mean_prev, self.var_prev = self.mean.copy(), self.var.copy()
         self.traj = [(cx, cy)]                # PPT용 궤적 기록
+        # 복합 보상은 에피소드 시작 시점에 정규화 기준을 잡아야 한다
+        if self.reward_fn is not None and hasattr(self.reward_fn, "reset"):
+            self.reward_fn.reset(self)
         return self._obs()
 
     def step(self, action: torch.Tensor):
-        theta = float(action[0]) * np.pi                       # [-1,1]->[-pi,pi]
-        span = np.hypot(self.canvas.max_lon - self.canvas.min_lon,
-                        self.canvas.max_lat - self.canvas.min_lat)
-        # 배터리 하드 제약: 남은 비율만큼만 이동 가능 (샘플러에서 여기로 이동 —
-        # 샘플러는 log-prob 역변환을 위해 '정규 공간' 행동만 다뤄야 함)
-        max_reach = min(1.0, self.battery / max(self.cfg.max_battery, 1e-6))
-        dist = float(action[1]) * self.cfg.max_step_frac * span * max_reach
-
+        # 이동 규칙은 src/env/motion.py 한 곳에만 둔다 — mcts(수읽기)와
+        # visualize_search(화면 투영)가 같은 함수를 쓴다. 세 곳이 어긋나면
+        # 화면·수읽기·실제 이동이 서로 다른 곳을 가리킨다.
+        # 배터리 하드 제약(남은 비율만큼만 이동)도 그 안에 있다 — 샘플러는
+        # log-prob 역변환을 위해 '정규 공간' 행동만 다뤄야 하므로 여기서 적용.
         d = self.drones[0]
-        lon = np.clip(d["lon"] + dist * np.cos(theta),
-                      self.canvas.min_lon, self.canvas.max_lon)
-        lat = np.clip(d["lat"] + dist * np.sin(theta),
-                      self.canvas.min_lat, self.canvas.max_lat)
+        lon, lat = motion.step_position(
+            d["lon"], d["lat"], action.detach().cpu().numpy(), self.battery,
+            self.cfg.max_battery, self.cfg.max_step_frac, self.extent,
+            clip=True)
+        lon, lat = float(lon), float(lat)
+        # clip=True 는 마스킹을 안 쓸 때의 안전망이다. 마스킹을 켜면 애초에
+        # 경계 밖 행동이 샘플되지 않으므로 여기서 잘릴 일이 없다.
         d["lon"], d["lat"] = lon, lat
         self.traj.append((lon, lat))
 
-        var_before = float(self.var[self.land].sum())
+        # 갱신 전 belief 를 보관 — RewardFn 이 before/after 차이를 봐야 한다
+        self.mean_prev, self.var_prev = self.mean, self.var
+        var_before = float(self.var_prev[self.land].sum())
 
         # 드론이 그 위치의 '진짜 값'을 측정 -> 관측점에 추가
         measured = self._ground_truth(lon, lat)
@@ -143,7 +162,22 @@ class AirQualityEnv:
         return float(self.gx[int(round(xs.mean()))]), float(self.gy[int(round(ys.mean()))])
 
     def _random_land_point(self):
-        ys, xs = np.where(self.land)
+        """무작위 시작 지점. flight_mask 가 있으면 본토(최대 연결 성분)로 제한.
+
+        바다 횡단 금지 하에서는 시작한 덩어리를 벗어날 수 없으므로, 섬에서
+        시작하면 그 에피소드는 사실상 무의미해진다.
+        """
+        if self._start_pool is None:
+            ys, xs = np.where(self.land)
+            if self.flight_mask is not None:
+                main = self.flight_mask.mainland_mask()
+                ii, jj = self.flight_mask._index(self.gx[xs], self.gy[ys])
+                keep = main[ii, jj]                    # 벡터화 — 에피소드마다 도는 코드
+                if keep.any():
+                    ys, xs = ys[keep], xs[keep]
+                    print(f"[시작위치] 본토 육지칸 {keep.sum()}/{len(keep)} 로 제한")
+            self._start_pool = (ys, xs)                # 한 번만 계산해 재사용
+        ys, xs = self._start_pool
         k = self.rng.integers(len(xs))
         return float(self.gx[xs[k]]), float(self.gy[ys[k]])
 

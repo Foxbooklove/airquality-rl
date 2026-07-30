@@ -55,26 +55,64 @@ pip install torch pykrige folium branca matplotlib geopandas pandas requests pya
 
 ## 실행
 
+모든 학습·시연은 하나의 엔트리포인트로 한다.
+
 ```bash
-python -m src.agent.run_real       # 학습 + figure 생성
-python -m src.agent.inspect_mcts   # MCTS 탐색 트리 디버깅
-python -m src.agent.run_skeleton   # 더미 환경으로 배선만 확인 (데이터 불필요)
+python -m src.agent.train                     # 헤드리스, 300 에피소드, 바닥부터
+python -m src.agent.train --mode live         # 브라우저로 보면서 학습 (무한)
+python -m src.agent.train --mode window       # matplotlib 창으로 보면서
+python -m src.agent.train --load best         # 최고 기록에서 이어서
+python -m src.agent.train --load latest       # 마지막 상태에서 이어서
+python -m src.agent.train --load results/x.pt # 특정 파일에서
+python -m src.agent.train --help              # 전체 옵션
 ```
 
-설정은 `src/agent/run_real.py` 상단 `SETTINGS` 에서 조절한다.
+`--mode live` 로 띄우면 콘솔에 주소가 찍힌다. 보는 쪽은 파이썬 없이 브라우저로
+주소만 열면 되고, 같은 네트워크면 다른 기기에서도 접속된다. 화면에서
+일시정지/재개(스페이스바)가 가능하다.
 
-| 항목 | 설명 |
+기본값은 **바닥부터 학습**이다. 이어서 하려면 `--load` 를 명시해야 한다
+(실수로 이전 결과에 이어붙는 사고 방지).
+
+주요 옵션 — 모드에 따라 기본값이 갈린다.
+
+| 옵션 | headless | live / window |
+|---|---|---|
+| `--episodes` | 300 | 0 (무한) |
+| `--ttl` (이동 예산) | 40 | 12 |
+| `--sampled` (K) | 8 | 4 (트리가 깊어져 수읽기가 잘 보임) |
+| `--figures` | on | off |
+
+그 밖에 `--region`, `--resolution`, `--snapshot`, `--bbox-pad`, `--sims`,
+`--lr`, `--no-train`, `--port` 등이 있다.
+
+출력은 `results/` 아래 용도별로 나뉜다.
+
+```
+results/
+├── checkpoints/   ckpt_latest.pt · ckpt_best.pt · gains.npy
+├── figures/       learning_curve.png · uncertainty.png · baseline.png
+├── maps/          trajectory.html  (folium)
+└── debug/         mcts_candidates_step*.png · mcts_tree_step*.png
+```
+
+| 체크포인트 | 저장 시점 |
 |---|---|
-| `REGION` | `None`=전국, `"서울특별시"` 등=해당 시도 |
-| `RESOLUTION` | Kriging 격자 해상도. 크면 정확하지만 느림 |
-| `BBOX_PAD` | `None`=전국 측정소 전부. 숫자=캔버스 주변만 사용 |
-| `TTL` | 드론 이동 예산 (스텝 수) |
-| `MAX_STEP_FRAC` | 스텝당 최대 이동거리 (캔버스 대각선 대비 비율) |
-| `EPISODES` | 학습 에피소드 수 |
+| `ckpt_latest.pt` | `--save-every` 에피소드마다 |
+| `ckpt_best.pt` | 최근 10 에피소드 평균 정보이득이 최고를 갱신할 때만 |
 
-결과는 `results/` 에 저장된다: `proto_trajectory_map.html` (folium 지도),
-`proto_uncertainty.png`, `proto_learning_curve.png`, `proto_baseline.png`,
-`proto_muzero.pt`.
+단일 에피소드는 시작 위치가 무작위라 편차가 커서, best 판단은 이동평균으로 한다.
+
+체크포인트에는 가중치뿐 아니라 **옵티마이저 상태 · 에피소드 수 · 기록 · best 기준값**이
+함께 저장된다. 이것들을 빼면 재시작 때 Adam 이 처음부터 시작해 학습이 흔들리고,
+best 기준값이 리셋되어 기존 `ckpt_best.pt` 를 더 나쁜 모델로 덮어쓴다.
+
+디버깅용 보조 스크립트:
+
+```bash
+python -m src.agent.inspect_mcts   # MCTS 탐색 트리 뜯어보기
+python -m src.agent.run_skeleton   # 더미 환경으로 배선만 확인 (데이터 불필요)
+```
 
 ## 구조
 
@@ -88,10 +126,11 @@ src/
 │   ├── mcts.py            Sampled MuZero MCTS
 │   ├── losses.py          가치 + 보상 + 정책 손실
 │   ├── replay.py          replay buffer (※ 아직 학습 루프에 연결 안 됨)
-│   ├── run_real.py        실데이터 학습 + figure 생성
+│   ├── train.py           통합 엔트리포인트 (학습 · 실시간 시연)
+│   ├── live_server.py     브라우저 실시간 모니터링 (MJPEG 스트리밍)
 │   ├── run_skeleton.py    더미 환경 배선 확인
 │   ├── inspect_mcts.py    MCTS 트리 디버깅
-│   └── visualize*.py      정적 figure / folium 지도 / MCTS 트리
+│   └── visualize*.py      figure / folium 지도 / MCTS 트리 / 실시간 탐색
 ├── data/                  AirKorea 수집 · 전처리
 └── env/
     ├── canvas.py          격자 + 육지 마스킹
@@ -130,5 +169,10 @@ src/
 4. **가치 헤드가 스칼라 MSE 다.** 논문은 categorical support 를 쓴다
    (`networks.py` 에 TODO).
 
-5. **하이퍼파라미터가 분산되어 있다.** `config.py`, `run_real.py` 의
-   `SETTINGS`, 그리고 `main()` 내 직접 지정이 섞여 있어 실험 재현이 어렵다.
+5. **정보이득이 드물게 음수가 된다.** pykrige 가 관측점 추가 시 variogram 을
+   다시 추정하므로, 국소 분산은 줄어도 총합이 늘 수 있다. variogram 을 최초 1회만
+   추정해 고정하면 해결된다.
+
+6. **에피소드마다 바뀌는 것이 시작 위치뿐이다.** 가시 측정소 집합과 스냅샷이
+   고정이라, 정책이 특정 농도장에 과적합될 수 있다. `reset()` 에서 스냅샷 시각과
+   분할을 무작위화하면 완화된다.
