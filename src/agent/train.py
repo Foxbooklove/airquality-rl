@@ -242,10 +242,12 @@ def main(argv=None):
     snap = pre.get_snapshot(args.snapshot, args.pollutant)
 
     risk = build_risk_field(args, canvas, RiskField)
-    reward = build_reward(args.reward, risk_field=risk, pollutant=args.pollutant,
-                          hazard_threshold=args.hazard_threshold,
-                          conc_floor=args.conc_floor)
-    print(f"[보상] {reward.describe()}")
+    # 이름을 reward 로 두면 루프의 `obs, reward, done = env.step(...)` 이
+    # 객체를 스칼라로 덮어쓴다 — reward_fn 으로 분리해야 한다.
+    reward_fn = build_reward(args.reward, risk_field=risk, pollutant=args.pollutant,
+                             hazard_threshold=args.hazard_threshold,
+                             conc_floor=args.conc_floor)
+    print(f"[보상] {reward_fn.describe()}")
 
     # 비행 마스크 — 바다 위 기능 고장 시 회수가 불가능해서 안전상 막는다.
     # 경로까지 검사하므로 canvas.land_mask(기본 60, 한 칸 8km)로는 부족하다.
@@ -257,7 +259,7 @@ def main(argv=None):
     env = AirQualityEnv(canvas, snap, cfg, pollutant=args.pollutant,
                         visible_ratio=args.visible_ratio,
                         bbox_pad=args.bbox_pad, seed=args.seed,
-                        reward_fn=reward,
+                        reward_fn=reward_fn,
                         flight_mask=fmask if args.mainland_only else None)
     print(f"         측정소 {env.n_stations}개, 육지칸 {int(canvas.land_mask.sum())}, "
           f"TTL={args.ttl}")
@@ -270,7 +272,13 @@ def main(argv=None):
     ckpt = resolve_ckpt(args.load)
     if ckpt is not None:
         resume_ep, resume_gains, resume_best = load_ckpt(ckpt, net, opt)
-        print(f"[모델] 이어서 학습: {ckpt.relative_to(ROOT)}")
+        # relative_to 는 레포 밖 경로에서 예외를 던진다 — --load 는 임의 경로를
+        # 허용하므로(절대경로 포함) 실패해도 죽지 않게 한다.
+        try:
+            shown = ckpt.relative_to(ROOT)
+        except ValueError:
+            shown = ckpt
+        print(f"[모델] 이어서 학습: {shown}")
         if resume_ep:
             ma = float(np.mean(resume_gains[-10:])) if resume_gains else 0.0
             print(f"       누적 {resume_ep} 에피소드까지 진행됨 "
@@ -413,7 +421,7 @@ def main(argv=None):
             if last_loss is not None:
                 line += f"| loss={last_loss:.3f}"
             # 항별 기여를 같이 찍는다 — λ 를 손으로 잡으려면 이게 없으면 못 한다
-            bd = reward.breakdown_str()
+            bd = reward_fn.breakdown_str()
             if bd:
                 line += f" | {bd}"
             if fmask is not None and ep_reject:

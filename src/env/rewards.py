@@ -192,10 +192,15 @@ class CompositeReward(RewardFn):
     # env.reset() 이 불러줌
     def reset(self, env) -> None:
         ctx0 = _context(env, env.var, env.mean)      # before == after == 초기 상태
-        for t, _ in self.terms:
+        # 가중치 0인 항은 reset 도 건너뛴다. __call__ 과 반드시 같은 조건이어야 한다 —
+        # 예전엔 reset 만 전부 돌아서, risk_field 없이 --reward info=1 을 주면
+        # (risk 항이 0인데도) RiskWeightedInfoGainTerm.reset 이 None.w 로 죽었다.
+        for t, lam in self.terms:
+            if lam == 0.0:
+                continue
             t.reset(env, ctx0)
         self.last = {}
-        self.ep_totals = {t.name: 0.0 for t, _ in self.terms}
+        self.ep_totals = {t.name: 0.0 for t, lam in self.terms if lam != 0.0}
 
     # env.step() 이 불러줌 — RewardFn 시그니처
     def __call__(self, env, action) -> float:
