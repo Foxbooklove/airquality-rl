@@ -227,7 +227,9 @@ setInterval(tick, 400); tick();
 
 
 def create_app(bus: FrameBus, ctl: "Controller | None" = None,
-               readonly: bool = False) -> Flask:
+               readonly: bool = False, fps: float = 3.0) -> Flask:
+    """fps 는 /stream 의 전송 상한. 프레임 1장이 약 39KB 라 제한 없이 보내면
+    핸드폰 데이터가 에피소드당 수백 MB 나간다. 0 이면 제한 없음."""
     app = Flask(__name__)
     app.logger.disabled = True
 
