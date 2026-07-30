@@ -310,6 +310,10 @@ def main(argv=None):
             interactive=(args.mode == "window"),
             on_frame=(bus.publish if bus else None),
             gate=(ctl.gate if ctl else None),
+            # 브라우저 속도 슬라이더를 실제로 연결한다. 안 넘기면 view.speed 가
+            # None 이라 _pause 의 배율이 항상 1.0 이고, 애니메이션 대기 때문에
+            # 무한 학습이 기어간다 (조절 UI 는 있는데 아무 효과가 없었다).
+            speed=((lambda: ctl.speed) if ctl else None),
             descend_pause=0.07, backup_pause=0.035, commit_pause=0.5,
             title="MCTS 수읽기 — 파랑=확정, 주황=탐색, 초록=선택")
 
