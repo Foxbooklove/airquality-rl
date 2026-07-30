@@ -5,6 +5,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 드론 자율 관측으로 대기질 농도장을 복원하는 Sampled MuZero 프로토타입.
 코드·주석·문서는 전부 한국어로 쓴다 (기존 파일 스타일 유지).
 
+## 실행 환경 주의 (2026-07 현재)
+
+**이 개발 머신에서는 `python` 이 아니라 `py -3.13` 을 써야 한다.**
+
+Windows 애플리케이션 제어 정책(Smart App Control / WDAC)이 서명 안 된 확장 모듈
+DLL 을 차단하고 있다. 상황:
+
+| 인터프리터 | 상태 |
+|---|---|
+| `python` = 3.12 | `pandas` DLL 차단 → 아무것도 안 됨 |
+| `py -3.13` | pandas·torch·shapely·pyproj·scipy·flask·pykrige·openpyxl 정상. **`pyarrow` 와 GDAL 만** 차단 |
+
+그래서 두 곳에 폴백을 두었다 (정책이 풀리면 자동으로 원래 경로를 쓴다):
+
+- **경계 로드** — [canvas.py](src/env/canvas.py) 의 `load_sido()` 가 geopandas 실패 시
+  `json` + `shapely` + `pyproj` 로 읽는다. 좌표 변환은 양쪽이 동일하고 결과도 일치함을 확인했다
+- **테이블 저장/로드** — [preprocess.py](src/data/preprocess.py) 가 parquet 엔진이 없으면
+  `.pkl` 로 떨어진다. `parquet_ok()` / `_save()` / `_read()` 참고.
+  기존 parquet 은 읽을 수 없으므로 XLSX 에서 다시 만들어야 한다:
+  `py -3.13 -m src.data.preprocess --rebuild` (396MB XLSX, 수 분, `.pkl` 약 1GB)
+
+근본 해결은 정책을 푸는 것이다. `results/` 에 옛 산출물이 있는 것으로 보아
+정책이 나중에 켜졌다.
+
 ## 실행
 
 모든 모듈은 **레포 루트에서 `python -m` 으로** 실행한다. import 가 전부

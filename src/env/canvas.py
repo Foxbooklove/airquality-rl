@@ -5,11 +5,53 @@ resolution 으로 격자 크기 조절. reference 보고 지역/해상도만 바
 """
 from pathlib import Path
 import numpy as np
-import geopandas as gpd
 from shapely.geometry import Point
 from shapely.prepared import prep
 
 ROOT = Path(__file__).resolve().parents[2]
+
+GEOJSON = ROOT / "data" / "raw" / "korea_sido.geojson"
+
+
+def load_sido(region: str | None = None):
+    """시도 경계를 위경도(4326) shapely 도형으로. region=None 이면 전국 합집합.
+
+    geopandas(=GDAL) 가 있으면 그걸 쓰고, 없으면 json+shapely+pyproj 로 읽는다.
+    GDAL 은 Windows 에서 설치가 자주 깨지고(애플리케이션 제어 정책이 DLL 을
+    차단하는 경우도 있다) 여기선 파일 하나 읽는 용도뿐이라, 폴백 경로를 둔다.
+    두 경로 모두 동일한 좌표 변환을 한다 (아래 CRS 주의사항 참고).
+
+    ⚠️ korea_sido.geojson 은 좌표가 UTMK(미터, EPSG:5179)인데 헤더엔 4326 으로
+       잘못 표기돼 있다. 5179 로 강제 지정한 뒤 위경도로 변환해야 측정소 좌표와 맞다.
+    """
+    try:
+        import geopandas as gpd
+        gdf = gpd.read_file(GEOJSON)
+        gdf = gdf.set_crs(5179, allow_override=True)   # 실제 좌표계로 덮어쓰기
+        gdf = gdf.to_crs(4326)                          # 위경도로 변환
+        if region is not None:
+            available = gdf["title"].tolist()           # 필터 전에 목록 저장
+            gdf = gdf[gdf["title"] == region]
+            if len(gdf) == 0:
+                raise ValueError(f"지역 없음: {region}. 가능: {available}")
+        return gdf.union_all()
+    except Exception as e:
+        if isinstance(e, ValueError) and "지역 없음" in str(e):
+            raise
+        import json
+        import pyproj
+        from shapely.geometry import shape
+        from shapely.ops import unary_union, transform
+        print(f"[Canvas] geopandas 사용 불가({type(e).__name__}) — "
+              f"json+pyproj 폴백으로 경계 로드")
+        feats = json.load(open(GEOJSON, encoding="utf-8"))["features"]
+        if region is not None:
+            available = [f["properties"]["title"] for f in feats]
+            feats = [f for f in feats if f["properties"]["title"] == region]
+            if not feats:
+                raise ValueError(f"지역 없음: {region}. 가능: {available}") from None
+        tr = pyproj.Transformer.from_crs(5179, 4326, always_xy=True).transform
+        return unary_union([transform(tr, shape(f["geometry"])) for f in feats])
 
 
 class Canvas:
@@ -21,19 +63,8 @@ class Canvas:
         self.region = region
         self.resolution = resolution
 
-        # 경계 로드
-        gdf = gpd.read_file(ROOT / "data" / "raw" / "korea_sido.geojson")
-
-        # ⚠️ 이 파일은 좌표가 UTMK(미터)인데 헤더엔 4326으로 잘못 표기돼 있음.
-        #    올바른 CRS(5179)로 강제 지정 후 위경도(4326)로 변환.
-        gdf = gdf.set_crs(5179, allow_override=True)   # 실제 좌표계로 덮어쓰기
-        gdf = gdf.to_crs(4326)                          # 위경도로 변환
-        if region is not None:
-            available = gdf["title"].tolist()      # 필터 전에 목록 저장
-            gdf = gdf[gdf["title"] == region]
-            if len(gdf) == 0:
-                raise ValueError(f"지역 없음: {region}. 가능: {available}")
-        self.boundary = gdf.union_all()          # 여러 시도를 하나의 폴리곤으로 합침
+        # 경계 로드 (CRS 처리는 load_sido 안에 있음)
+        self.boundary = load_sido(region)        # 여러 시도를 하나의 폴리곤으로 합침
         self._prepared = prep(self.boundary)     # 점-포함 판정 빠르게
 
         # bounding box

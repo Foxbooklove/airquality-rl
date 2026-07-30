@@ -75,9 +75,19 @@ class FrameBus:
     def set_status(self, **kw):
         self.status.update(kw)
 
-    def frames(self, timeout: float = 30.0):
-        """새 프레임이 올 때마다 yield (없으면 마지막 걸 유지)."""
-        last = -1
+    def frames(self, timeout: float = 30.0, min_interval: float = 0.0):
+        """새 프레임이 올 때마다 yield (없으면 마지막 걸 유지).
+
+        min_interval: 전송 최소 간격(초). 그보다 빨리 생성된 프레임은 건너뛰고
+        간격이 찰 때까지 기다린 뒤 **그 시점의 최신 프레임**을 보낸다.
+
+        왜 필요한가: 수읽기 애니메이션은 스텝당 200장 넘게 프레임을 만든다.
+        프레임 1장이 약 39KB 이므로 sims=30·TTL=40 이면 에피소드당 325MB 다.
+        핸드폰으로 보면 데이터가 순식간에 사라진다. 로컬 애니메이션은 그대로
+        두고 네트워크 전송만 줄인다 (중간 프레임을 버리므로 화면은 건너뛰며 보인다).
+        """
+        import time
+        last, last_t = -1, 0.0
         while True:
             with self._cond:
                 if self._seq == last:
@@ -85,6 +95,14 @@ class FrameBus:
                 if self._frame is None:
                     continue
                 frame, last = self._frame, self._seq
+            if min_interval > 0.0:
+                wait = min_interval - (time.monotonic() - last_t)
+                if wait > 0:
+                    time.sleep(wait)
+                    with self._cond:      # 대기 중 갱신된 최신 프레임으로 교체
+                        if self._frame is not None:
+                            frame, last = self._frame, self._seq
+                last_t = time.monotonic()
             yield frame
 
 
@@ -250,7 +268,7 @@ def create_app(bus: FrameBus, ctl: "Controller | None" = None,
     @app.get("/stream")
     def stream():
         def gen():
-            for frame in bus.frames():
+            for frame in bus.frames(min_interval=(1.0 / fps if fps > 0 else 0.0)):
                 yield (b"--" + _BOUNDARY.encode() + b"\r\n"
                        b"Content-Type: image/jpeg\r\n"
                        b"Content-Length: " + str(len(frame)).encode() +
@@ -262,10 +280,13 @@ def create_app(bus: FrameBus, ctl: "Controller | None" = None,
 
 
 def serve_in_background(bus: FrameBus, ctl: "Controller | None" = None,
-                        host="0.0.0.0", port=8000, readonly=False) -> str:
+                        host="0.0.0.0", port=8000, readonly=False,
+                        fps: float = 3.0) -> str:
     """서버를 데몬 스레드로 띄우고 접속 주소를 돌려준다.
-    readonly=True 면 관람객이 일시정지 등 제어를 할 수 없다(공개용)."""
-    app = create_app(bus, ctl, readonly)
+    readonly=True 면 관람객이 일시정지 등 제어를 할 수 없다(공개용).
+    fps 는 네트워크 전송 상한 — 프레임 1장이 약 39KB 라 제한 없이 보내면
+    핸드폰 데이터가 에피소드당 수백 MB 씩 나간다. 0 이면 제한 없음."""
+    app = create_app(bus, ctl, readonly, fps=fps)
     import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     t = threading.Thread(

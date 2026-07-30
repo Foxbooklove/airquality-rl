@@ -25,6 +25,49 @@ _RENAME = {
 POLLUTANTS = ["SO2", "CO", "O3", "NO2", "PM10", "PM25"]
 
 
+def parquet_ok() -> bool:
+    """parquet 엔진이 실제로 import 되는가.
+
+    pyarrow 는 설치돼 있어도 DLL 로드가 막힐 수 있다 (Windows 애플리케이션 제어
+    정책이 서명 안 된 확장 모듈을 차단하는 경우). 그럴 때 pickle 로 떨어진다.
+    """
+    for mod in ("pyarrow", "fastparquet"):
+        try:
+            __import__(mod)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _save(df: pd.DataFrame, path: Path) -> Path:
+    """parquet 이 가능하면 parquet, 아니면 같은 이름의 .pkl 로."""
+    if path.suffix == ".parquet" and not parquet_ok():
+        path = path.with_suffix(".pkl")
+    if path.suffix == ".pkl":
+        df.to_pickle(path)
+    else:
+        df.to_parquet(path, index=False)
+    return path
+
+
+def _read(path: Path) -> pd.DataFrame:
+    """parquet 우선, 못 읽으면 옆의 .pkl. 둘 다 없으면 안내와 함께 실패."""
+    pkl = path.with_suffix(".pkl")
+    if path.exists() and parquet_ok():
+        return pd.read_parquet(path)
+    if pkl.exists():
+        return pd.read_pickle(pkl)
+    if path.exists() and not parquet_ok():
+        raise RuntimeError(
+            f"{path.name} 은 있는데 parquet 엔진(pyarrow/fastparquet)을 쓸 수 없습니다.\n"
+            f"  XLSX 에서 다시 만들어 pickle 로 저장하세요:\n"
+            f"    python -m src.data.preprocess --rebuild\n"
+            f"  (원본 XLSX 396MB 를 읽으므로 수 분 걸립니다)")
+    raise FileNotFoundError(f"{path.name} / {pkl.name} 둘 다 없음. "
+                            f"python -m src.data.preprocess 를 먼저 실행하세요.")
+
+
 class AirQualityPreprocessor:
     def __init__(self, year: int = 2024):
         self.year = year
@@ -39,27 +82,26 @@ class AirQualityPreprocessor:
 
     # ---------- 1단계: XLSX → raw parquet (단발성, 무거움) ----------
     def build_raw_parquet(self, force: bool = False):
-        """월별 12시트를 모두 읽어 합친 뒤 raw parquet 저장. 한 번만 돌리면 됨."""
-        if self.raw_parquet.exists() and not force:
-            print(f"raw parquet 이미 있음: {self.raw_parquet.name} (force=True로 재생성)")
+        """월별 12시트를 모두 읽어 합친 뒤 raw 저장. 한 번만 돌리면 됨."""
+        have = (self.raw_parquet.exists() and parquet_ok()) or \
+               self.raw_parquet.with_suffix(".pkl").exists()
+        if have and not force:
+            print(f"raw 이미 있음: {self.raw_parquet.stem} (force=True로 재생성)")
             return
 
-        print("XLSX 전체 시트 읽는 중... (12개월, 오래 걸림)")
+        print("XLSX 전체 시트 읽는 중... (12개월, 396MB, 수 분 걸림)")
         sheets = pd.read_excel(self.xlsx, sheet_name=None)   # 모든 시트를 dict로
         df = pd.concat(sheets.values(), ignore_index=True)
         df = df.rename(columns=_RENAME)
         print(f"  합친 전체: {len(df):,} 행")
 
-        df.to_parquet(self.raw_parquet, index=False)
-        print(f"  저장: {self.raw_parquet.name} ({self.raw_parquet.stat().st_size/1e6:.1f} MB)")
+        out = _save(df, self.raw_parquet)
+        print(f"  저장: {out.name} ({out.stat().st_size/1e6:.1f} MB)")
 
     # ---------- 2단계: raw → datetime + 위경도 (반복 가능) ----------
     def process(self, save: bool = True) -> pd.DataFrame:
         """raw parquet 에 datetime 변환(24시 처리)과 위경도 매핑을 적용."""
-        if not self.raw_parquet.exists():
-            raise FileNotFoundError("raw parquet 없음. 먼저 build_raw_parquet() 실행.")
-
-        df = pd.read_parquet(self.raw_parquet)
+        df = _read(self.raw_parquet)
 
         # datetime 변환: YYYYMMDDHH(HH=1~24). 24시는 다음날 0시로.
         s = df["datetime_raw"].astype(str).str.zfill(10)
@@ -77,14 +119,15 @@ class AirQualityPreprocessor:
         df = df.merge(coords, on="station", how="inner")
 
         if save:
-            df.to_parquet(self.proc_parquet, index=False)
+            _save(df, self.proc_parquet)
         return df
 
     def load(self) -> pd.DataFrame:
-        """이미 처리된 parquet 을 읽음 (없으면 process 실행)."""
-        if self.proc_parquet.exists():
-            return pd.read_parquet(self.proc_parquet)
-        return self.process()
+        """이미 처리된 파일을 읽음 (없으면 process 실행)."""
+        try:
+            return _read(self.proc_parquet)
+        except (FileNotFoundError, RuntimeError):
+            return self.process()
 
     # ---------- 3단계: 스냅샷 추출 (환경/시각화 입력) ----------
     def get_snapshot(self, dt, pollutant: str = "PM10", df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -99,15 +142,24 @@ class AirQualityPreprocessor:
 
 
 if __name__ == "__main__":
-    pre = AirQualityPreprocessor(year=2024)
+    import argparse
+    ap = argparse.ArgumentParser(description="XLSX -> 분석용 테이블")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="XLSX 부터 다시 만든다 (parquet 을 못 읽을 때)")
+    ap.add_argument("--year", type=int, default=2024)
+    a = ap.parse_args()
 
-    pre.build_raw_parquet()          # 이미 있으면 건너뜀
+    print(f"[저장형식] {'parquet' if parquet_ok() else 'pickle (parquet 엔진 사용 불가)'}")
+    pre = AirQualityPreprocessor(year=a.year)
+
+    pre.build_raw_parquet(force=a.rebuild)   # 이미 있으면 건너뜀
     df = pre.process()
 
     print(f"처리 후 전체: {len(df):,} 행")
     print(f"측정소 수: {df['station'].nunique()}개")
     print(f"기간: {df['datetime'].min()} ~ {df['datetime'].max()}")
-    print(f"저장: {pre.proc_parquet.name}")
+    # 실제 저장 경로를 찍는다 — parquet 을 못 쓰면 .pkl 로 떨어지므로
+    print(f"저장: {(pre.proc_parquet if parquet_ok() else pre.proc_parquet.with_suffix('.pkl')).name}")
 
     # 스냅샷 동작 확인 — 임의 시각 하나
     snap = pre.get_snapshot("2024-07-01 13:00", "PM10", df=df)

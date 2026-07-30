@@ -51,6 +51,10 @@ def parse_args(argv=None):
     g.add_argument("--port", type=int, default=8000, help="live 모드 웹 포트")
     g.add_argument("--public", action="store_true",
                    help="읽기 전용으로 공개 (관람객이 일시정지 등 제어 불가)")
+    g.add_argument("--fps", type=float, default=3.0,
+                   help="live 모드 전송 프레임 상한. 프레임 1장이 약 39KB 라 "
+                        "제한 없이 보내면 핸드폰 데이터가 에피소드당 수백 MB. "
+                        "1=시간당 140MB, 3=420MB. 0 이면 제한 없음")
     g.add_argument("--figures", action="store_true",
                    help="종료 시 figure + 랜덤 baseline 비교 생성 (headless 기본 on)")
     g.add_argument("--no-figures", dest="figures", action="store_false")
@@ -297,7 +301,7 @@ def main(argv=None):
             from src.agent.live_server import FrameBus, Controller, serve_in_background
             bus, ctl = FrameBus(), Controller()
             url = serve_in_background(bus, ctl, port=args.port,
-                                      readonly=args.public)
+                                      readonly=args.public, fps=args.fps)
             print(f"\n  ┌─ 브라우저에서 열기 ──────────────────────")
             print(f"  │  이 컴퓨터  : http://localhost:{args.port}")
             print(f"  │  같은 네트워크: {url}")
