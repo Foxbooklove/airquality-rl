@@ -81,7 +81,7 @@ def main(argv=None):
         # train.py 와 같은 로더 사용 — 체크포인트가 가중치만이 아니라
         # {model, optim, episode, gains, best_ma} 딕셔너리라서 직접 읽으면 깨진다.
         from src.agent.train import load_ckpt
-        ep, _, _ = load_ckpt(ckpt, net, None)
+        ep, _, _, _ = load_ckpt(ckpt, net, None)
         print(f"[모델] 체크포인트 로드: {CKPT}"
               + (f" (누적 {ep} 에피소드)" if ep else ""))
     else:

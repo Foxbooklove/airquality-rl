@@ -116,6 +116,23 @@ def parse_args(argv=None):
                    help="노드당 후보 행동 수 K. 기본: headless=8, live/window=4"
                         " (작을수록 트리가 깊어져 수읽기가 잘 보임)")
     g.add_argument("--lr", type=float, default=1e-3)
+
+    g = p.add_argument_group("학습 (replay)")
+    g.add_argument("--replay", type=int, default=200,
+                   help="궤적 버퍼 용량. Kriging 때문에 수집이 비싸 재사용이 중요")
+    g.add_argument("--updates", type=int, default=20,
+                   help="에피소드당 gradient step 수. 예전엔 1회뿐이라 190 에피소드 = "
+                        "190 업데이트였고 학습이 전혀 안 됐다")
+    g.add_argument("--batch-size", type=int, default=8,
+                   help="업데이트 1회에 평균낼 (궤적, 시작지점) 샘플 수")
+    g.add_argument("--reward-scale", default="auto", metavar="auto|숫자",
+                   help="가치·보상 타깃 배율. 정보이득이 에피소드당 0.07 수준이라 "
+                        "그대로 두면 가치 헤드에 그래디언트가 안 가고 PUCT 도 "
+                        "탐색항에 압도된다. auto 면 초반 몇 판을 보고 정해 고정")
+    g.add_argument("--scale-warmup", type=int, default=5,
+                   help="auto 스케일을 정하는 데 쓸 초반 에피소드 수 (그동안은 학습 안 함)")
+    g.add_argument("--scale-target", type=float, default=1.0,
+                   help="워밍업 리턴 중앙값이 이 값이 되도록 배율을 잡는다")
     g.add_argument("--seed", type=int, default=0)
 
     a = p.parse_args(argv)
@@ -157,7 +174,7 @@ def resolve_ckpt(spec: str | None) -> Path | None:
     return p
 
 
-def save_ckpt(path, net, opt, episode, gains, best_ma):
+def save_ckpt(path, net, opt, episode, gains, best_ma, reward_scale=1.0):
     """가중치만이 아니라 학습 상태 전체를 저장.
 
     옵티마이저 상태(Adam 모멘텀)와 best 기준값을 빼먹으면:
@@ -170,7 +187,8 @@ def save_ckpt(path, net, opt, episode, gains, best_ma):
                 "optim": opt.state_dict() if opt is not None else None,
                 "episode": episode,
                 "gains": list(gains),
-                "best_ma": best_ma}, path)
+                "best_ma": best_ma,
+                "reward_scale": reward_scale}, path)
 
 
 def load_ckpt(path, net, opt):
@@ -179,7 +197,7 @@ def load_ckpt(path, net, opt):
     blob = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(blob, dict) or "model" not in blob:
         net.load_state_dict(blob)          # 옛 형식: state_dict 그대로
-        return 0, [], -float("inf")
+        return 0, [], -float("inf"), None
     net.load_state_dict(blob["model"])
     if opt is not None and blob.get("optim") is not None:
         try:
@@ -187,7 +205,7 @@ def load_ckpt(path, net, opt):
         except Exception as e:
             print(f"[모델] 옵티마이저 상태 복원 실패(무시): {e}")
     return (blob.get("episode", 0), list(blob.get("gains", [])),
-            blob.get("best_ma", -float("inf")))
+            blob.get("best_ma", -float("inf")), blob.get("reward_scale"))
 
 
 def build_risk_field(args, canvas, RiskField):
@@ -225,6 +243,7 @@ def main(argv=None):
     from src.agent.muzero import MuZeroNet
     from src.agent.mcts import SampledMuZeroMCTS
     from src.agent.losses import compute_losses
+    from src.agent.replay import ReplayBuffer
     from src.env.air_quality_env import AirQualityEnv
     from src.env.canvas import Canvas
     from src.env.motion import FlightMask
@@ -272,10 +291,10 @@ def main(argv=None):
     train = not args.no_train
     opt = torch.optim.Adam(net.parameters(), lr=args.lr) if train else None
 
-    resume_ep, resume_gains, resume_best = 0, [], -float("inf")
+    resume_ep, resume_gains, resume_best, resume_scale = 0, [], -float("inf"), None
     ckpt = resolve_ckpt(args.load)
     if ckpt is not None:
-        resume_ep, resume_gains, resume_best = load_ckpt(ckpt, net, opt)
+        resume_ep, resume_gains, resume_best, resume_scale = load_ckpt(ckpt, net, opt)
         # relative_to 는 레포 밖 경로에서 예외를 던진다 — --load 는 임의 경로를
         # 허용하므로(절대경로 포함) 실패해도 죽지 않게 한다.
         try:
@@ -283,6 +302,9 @@ def main(argv=None):
         except ValueError:
             shown = ckpt
         print(f"[모델] 이어서 학습: {shown}")
+        if resume_scale:
+            cfg.reward_scale = float(resume_scale)
+            print(f"       보상 스케일 복원: {cfg.reward_scale:.1f} (다시 측정하지 않음)")
         if resume_ep:
             ma = float(np.mean(resume_gains[-10:])) if resume_gains else 0.0
             print(f"       누적 {resume_ep} 에피소드까지 진행됨 "
@@ -335,6 +357,18 @@ def main(argv=None):
     gains, best_ma, last_loss = resume_gains, resume_best, None
     episode = resume_ep
     endless = args.episodes == 0
+    buf = ReplayBuffer(capacity=args.replay, seed=args.seed)
+    n_updates = 0
+    # 보상 스케일: auto 면 초반 --scale-warmup 판을 모아 중앙값으로 정하고 고정한다.
+    # 중간에 바꾸면 이미 학습한 가치 함수가 통째로 어긋난다.
+    auto_scale = str(args.reward_scale).lower() == "auto"
+    if not auto_scale:
+        cfg.reward_scale = float(args.reward_scale)
+    scale_fixed = (not auto_scale) or (resume_scale is not None)
+    warmup_returns = []
+    if train:
+        print(f"[replay] 용량 {args.replay} 궤적, 에피소드당 업데이트 {args.updates}회 "
+              f"× 배치 {args.batch_size} (= 에피소드당 gradient step {args.updates}회)")
 
     try:
         target = resume_ep + args.episodes   # 이번 실행에서 돌릴 만큼 더
@@ -406,21 +440,55 @@ def main(argv=None):
                     traj[t]["value_target"] = G
                     G = traj[t]["reward"] + cfg.discount * G
 
-                loss, _ = compute_losses(net, cfg, traj)
-                opt.zero_grad(); loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
-                opt.step()
-                last_loss = float(loss.detach())
+                # 궤적을 버퍼에 넣고 재사용한다. 예전엔 궤적 1개를 딱 1번 쓰고
+                # 버려서 gradient step 총 개수 = 에피소드 수였다(190 에피소드 =
+                # 190 업데이트). MuZero 는 보통 수만~수백만 업데이트가 필요하다.
+                buf.add(traj)
+
+                if not scale_fixed:
+                    warmup_returns.append(total)
+                    if len(warmup_returns) < args.scale_warmup:
+                        print(f"  ep {episode:4d} | reward={total:.3f} "
+                              f"[워밍업 {len(warmup_returns)}/{args.scale_warmup} "
+                              f"— 보상 스케일 측정 중, 학습 보류]")
+                        continue
+                    med = float(np.median(np.abs(warmup_returns)))
+                    cfg.reward_scale = (args.scale_target / med) if med > 1e-9 else 1.0
+                    scale_fixed = True
+                    print(f"[스케일] 워밍업 {len(warmup_returns)}판 리턴 중앙값 {med:.4f} "
+                          f"-> reward_scale={cfg.reward_scale:.1f} "
+                          f"(가치 타깃이 약 {args.scale_target} 규모가 된다)")
+
+                # 업데이트 1회 = batch_size 개 (궤적, 시작지점) 샘플의 손실 평균.
+                # 관측점 개수 N 이 스텝마다 달라 텐서 배치가 안 되므로, 순차로
+                # 계산해 그래디언트를 누적한다 — 효과는 배치와 동일하고
+                # (Kriging 이 병목이라) 추가 forward 비용은 무시할 만하다.
+                last_parts = None
+                for _ in range(args.updates):
+                    opt.zero_grad()
+                    got = 0
+                    for tr, t0 in buf.sample_batch(args.batch_size, cfg.unroll_steps):
+                        l, parts = compute_losses(net, cfg, tr, t0=t0)
+                        if parts["steps"] == 0:
+                            continue
+                        (l / args.batch_size).backward()
+                        got += 1
+                        last_parts = parts
+                        last_loss = float(l.detach())
+                    if got:
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+                        opt.step()
+                        n_updates += 1
 
                 # 최근 10 에피소드 평균으로 best 판단 (단일 에피소드는 편차가 큼)
                 ma = float(np.mean(gains[-10:]))
                 if len(gains) >= 3 and ma > best_ma:
                     best_ma = ma
                     save_ckpt(CKPT_DIR / "ckpt_best.pt", net, opt,
-                              episode, gains, best_ma)
+                              episode, gains, best_ma, cfg.reward_scale)
                 if episode % args.save_every == 0:
                     save_ckpt(CKPT_DIR / "ckpt_latest.pt", net, opt,
-                              episode, gains, best_ma)
+                              episode, gains, best_ma, cfg.reward_scale)
                     np.save(CKPT_DIR / "gains.npy", np.array(gains))
 
             ma10 = float(np.mean(gains[-10:]))
@@ -428,6 +496,10 @@ def main(argv=None):
                     f"(최근10 {ma10:.3f}) ")
             if last_loss is not None:
                 line += f"| loss={last_loss:.3f}"
+                if last_parts:
+                    line += (f" (v {last_parts['value']:.3f} r {last_parts['reward']:.3f}"
+                             f" p {last_parts['policy']:.3f})")
+                line += f" | upd {n_updates}"
             # 항별 기여를 같이 찍는다 — λ 를 손으로 잡으려면 이게 없으면 못 한다
             bd = reward_fn.breakdown_str()
             if bd:
@@ -453,7 +525,8 @@ def main(argv=None):
         print("\n중단됨")
 
     if train:
-        save_ckpt(CKPT_DIR / "ckpt_latest.pt", net, opt, episode, gains, best_ma)
+        save_ckpt(CKPT_DIR / "ckpt_latest.pt", net, opt, episode, gains, best_ma,
+                  cfg.reward_scale)
         np.save(CKPT_DIR / "gains.npy", np.array(gains))
         print(f"[저장] results/checkpoints/ckpt_latest.pt"
               + (", ckpt_best.pt" if best_ma > -float("inf") else ""))
