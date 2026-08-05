@@ -39,7 +39,8 @@ def parse_args(argv=None):
     g.add_argument("--pollutant", default="PM10")
     g.add_argument("--threshold", type=float, default=80.0)
     g.add_argument("--hidden-ratio", type=float, default=0.35)
-    g.add_argument("--battery-km", type=float, default=250.0)
+    g.add_argument("--battery-km", type=float, default=400.0,
+                   help="드론 1대 왕복 예산. 250 이면 에피소드가 짧아 방문 지점이 적다")
     g.add_argument("--speed-kmh", type=float, default=70.0)
     g.add_argument("--drones", type=int, default=3)
     g.add_argument("--event-prob", type=float, default=0.7,
