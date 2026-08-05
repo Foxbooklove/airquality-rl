@@ -5,6 +5,9 @@ data/processed/
 # 인증키
 configs/secrets.py
 configs/secrets.*
+*.key
+*.pem
+.env
 
 # 결과물
 results/
