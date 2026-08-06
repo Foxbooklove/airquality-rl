@@ -53,16 +53,28 @@ class GridRepresentation(nn.Module):
     """h: 관측 -> 잠재 특징맵 [B, C, G, G].
 
     입력 평면 (채널 순서):
-      0,1  belief (Kriging mean, variance)
-      2    측정점 밀도 — 각 칸에 관측점이 몇 개 있나 (DeepSets 평균풀링 대체)
-      3    측정점 값 평균
-      4    현재 드론 위치 (원-핫에 가까운 가우시안 범프)
-      5    기지 위치
-      6    남은 배터리 (상수 평면)
-      7,8  절대 좌표 x, y
+      0,1   belief (Kriging mean, variance)
+      2     측정점 밀도 — 각 칸에 관측점이 몇 개 있나 (DeepSets 평균풀링 대체)
+      3     측정점 값 평균
+      4     현재 드론 위치 (원-핫에 가까운 가우시안 범프)
+      5     기지 위치
+      6     남은 배터리 (상수 평면)
+      7,8   절대 좌표 x, y
+      9     **방문 최근성** — 이 칸을 얼마나 최근에 쟀나 (exp 감쇠)
+      10    **마지막 측정값** — 거기서 뭘 읽었나
+      11    **직전 위치** — 두 칸 왕복을 스스로 알아채게
+      12,13 **시각** (하루 주기 sin/cos, 상수 평면)
+      14    **에피소드 경과** (상수 평면)
+
+    9~14 를 넣는 이유:
+      보상이 (측정소, 시각) 단위라 같은 지점을 다시 재는 게 유효한 전략이다
+      (값이 오를 때 잡는다). 그런데 언제 무엇을 쟀는지, 지금 몇 시인지를 모르면
+      그 판단이 불가능하다 — 문제가 마르코프가 아니게 된다. 실제로 이 평면들이
+      없을 때 학습된 정책은 두 칸을 9시간 왕복하며 탐지 0 을 기록했다.
+      MuZero 원논문도 표현망에 최근 관측 + **최근 행동**을 함께 넣는다.
     """
 
-    N_PLANES = 9
+    N_PLANES = 15
 
     def __init__(self, cfg: ModelConfig, channels: int = 48, blocks: int = 3):
         super().__init__()
@@ -106,6 +118,21 @@ class GridRepresentation(nn.Module):
         planes.append(bump(home[:, :2]) if home is not None else torch.zeros_like(planes[-1]))
         planes.append(drone[:, 2, None, None, None].expand(B, 1, G, G))
         planes.append(coord.expand(B, 2, G, G))
+
+        # --- 기억: 방문 최근성 + 마지막 측정값 (환경이 격자로 만들어 준다) ---
+        mem = getattr(obs, "memory", None)
+        planes.append(mem if mem is not None
+                      else torch.zeros(B, 2, G, G, device=dev))
+        # --- 직전 위치 ---
+        prev = getattr(obs, "prev", None)
+        planes.append(bump(prev[:, :2]) if prev is not None
+                      else torch.zeros(B, 1, G, G, device=dev))
+        # --- 시각 (하루 주기 2 + 경과 1) ---
+        tt = getattr(obs, "time", None)
+        if tt is None:
+            planes.append(torch.zeros(B, 3, G, G, device=dev))
+        else:
+            planes.append(tt[:, :, None, None].expand(B, 3, G, G))
         return torch.cat(planes, dim=1)
 
     def forward(self, obs) -> torch.Tensor:

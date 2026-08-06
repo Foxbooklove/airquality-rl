@@ -52,8 +52,15 @@ class SortieSpec:
     pollutant: str = "PM10"
     threshold: float = 80.0        # 사건 임계 (예보 '나쁨' 81 에 준함)
     hidden_ratio: float = 0.35     # 은닉 측정소 비율
-    battery_km: float = 400.0      # 드론 1대 왕복 이동 예산
-    speed_kmh: float = 70.0        # 순항 속도 — 시간 진행 계산에 쓴다
+    battery_h: float = 12.0        # 드론 1대의 비행 가능 **시간**
+    """배터리를 거리가 아니라 시간으로 센다.
+
+    거리 기준이면 짧은 이동이 싸서, 제자리에 있고 싶을 때 두 칸 사이를 왕복하는
+    게 최적이 된다(실측: 학습된 정책이 18.5km 왕복을 9시간 반복, 탐지 0).
+    시간 기준이면 제자리든 45km 이동이든 1시간이면 같은 값을 쓴다. 실제 드론
+    배터리도 거리가 아니라 체공 시간으로 표시되므로 물리적으로도 맞다.
+    """
+    speed_kmh: float = 70.0        # 순항 속도 — 이동 시간 계산
     max_hop_km: float = 45.0       # 한 수의 최대 이동거리.
     """제한하지 않으면 배터리를 한두 번의 큰 점프로 다 써서 에피소드가 10스텝에
     끝난다(측정). 걸음을 잘게 나눠야 방문 지점이 늘고 수읽기도 의미가 생긴다."""
@@ -148,7 +155,10 @@ class SortieEnv:
         self.drone_i = 0
         self.traj, self.sorties = [], []
         self.found = []                    # 탐지한 (측정소idx, 시각idx, 값)
-        self.visited_hidden = set()
+        self.visited_hidden = set()        # 통계용 (보상 판정에는 안 씀)
+        self.measured = set()              # (측정소idx, 시각idx) — 보상 중복 방지
+        self.last_seen = {}                # 측정소idx -> (시각, 값). 관측 기억용
+        self.prev_pos_km = None
 
         self._fit_variogram()
         self._update_belief()
@@ -163,8 +173,12 @@ class SortieEnv:
         hx, hy = self.home_km
         d_go = np.hypot(self._GX - x0, self._GY - y0)
         d_back = np.hypot(self._GX - hx, self._GY - hy)
-        ok = (self.land & ((d_go + d_back) <= self.battery + 1e-9)
-              & (d_go > 1e-9) & (d_go <= self.spec.max_hop_km))
+        # 한 수는 최소 1시간. 제자리(d_go=0)도 1시간치 배터리를 쓴다 —
+        # 실제 드론도 같은 자리에 떠 있으려면 동력이 든다.
+        h_go = np.maximum(1.0, d_go / self.spec.speed_kmh)
+        h_back = d_back / self.spec.speed_kmh
+        ok = (self.land & ((h_go + h_back) <= self.battery + 1e-9)
+              & (d_go <= self.spec.max_hop_km))
         if not ok.any():
             return ok
         ii, jj = np.where(ok)
@@ -183,41 +197,47 @@ class SortieEnv:
         if self.phase == PHASE_LAUNCH:
             self.home = self.pos = (lon, lat)
             self.home_km = self.pos_km = (float(self._GX[i, j]), float(self._GY[i, j]))
-            self.battery = s.battery_km
+            self.battery = s.battery_h
             self.phase, self.drone_i = PHASE_FLY, 1
             self.traj.append((lon, lat, 1))
             self.sorties.append([(lon, lat)])
             return self._obs(), 0.0, False       # 즉시 보상 0 — 가치가 전부 미래에 있다
 
-        # --- 이동: 거리만큼 배터리를 쓰고 시간이 흐른다 ---
+        # --- 이동(또는 제자리): 걸린 시간만큼 배터리를 쓰고 시각이 흐른다 ---
         nx, ny = float(self._GX[i, j]), float(self._GY[i, j])
         d_km = float(np.hypot(nx - self.pos_km[0], ny - self.pos_km[1]))
-        self.battery = max(0.0, self.battery - d_km)
+        dh = max(1.0, d_km / s.speed_kmh)          # 최소 1시간
+        self.battery = max(0.0, self.battery - dh)
+        self.prev_pos_km = self.pos_km
         self.pos, self.pos_km = (lon, lat), (nx, ny)
-        self.t = min(len(self.T) - 1, self.t + max(1, int(round(d_km / s.speed_kmh))))
+        self.t = min(len(self.T) - 1, self.t + int(round(dh)))
         self.traj.append((lon, lat, self.drone_i))
         self.sorties[-1].append((lon, lat))
 
         # --- 측정: 은닉 측정소가 반경 안에 있을 때만 실측을 얻는다 ---
-        reward, hit = 0.0, None
+        # 보상은 **(측정소, 시각)** 단위다. 같은 지점을 다시 재도 시각이 다르면
+        # 새 관측이다 — 13->19->...->100 으로 오르는 걸 지켜보다 잡는 것이
+        # 유효한 전략이어야 한다. 예전엔 지점 단위라 한 번 가면 그 지점이 영원히
+        # 죽었고, 그래서 '기다렸다 잡기' 가 원천 봉쇄돼 있었다.
+        reward = 0.0
         d_hid = np.hypot(self.sxy[self.hidden, 0] - nx, self.sxy[self.hidden, 1] - ny)
         near = np.where(d_hid <= s.detect_radius_km)[0]
         for h in near:
             gi = int(self.hidden[h])
-            if gi in self.visited_hidden:
+            if (gi, self.t) in self.measured:
                 continue
             val = self.A[self.t, gi]
             if not np.isfinite(val):
                 continue
+            self.measured.add((gi, self.t))
             self.visited_hidden.add(gi)
-            hit = (gi, self.t, float(val))
-            over = float(val) >= s.threshold
+            self.last_seen[gi] = (self.t, float(val))
             r = s.w_dense * float(np.clip(val / s.threshold, 0.0, 2.0))
             self.reward_terms["dense"] += r
-            if over:
+            if float(val) >= s.threshold:
                 r += s.w_detect
                 self.reward_terms["detect"] += s.w_detect
-                self.found.append(hit)
+                self.found.append((gi, self.t, float(val)))
             reward += r
 
         self._update_belief()
@@ -231,7 +251,7 @@ class SortieEnv:
             else:
                 self.drone_i += 1
                 self.pos, self.pos_km = self.home, self.home_km
-                self.battery = s.battery_km
+                self.battery = s.battery_h
                 self.sorties.append([self.home])
                 self.traj.append((self.home[0], self.home[1], self.drone_i))
         return self._obs(), reward, done
@@ -253,7 +273,7 @@ class SortieEnv:
         row = self.A[self.t]
         idx = self.visible[np.isfinite(row[self.visible])]
         lon, lat, val = list(self.slon[idx]), list(self.slat[idx]), list(row[idx])
-        for gi, ts, v in self.found:            # 드론이 얻은 실측도 belief 에 반영
+        for gi, (ts, v) in self.last_seen.items():   # 드론이 얻은 실측(지점별 최신)
             lon.append(self.slon[gi]); lat.append(self.slat[gi]); val.append(v)
         ok = OrdinaryKriging(np.array(lon), np.array(lat), np.array(val),
                              variogram_model="spherical",
@@ -297,11 +317,41 @@ class SortieEnv:
             dy = (self.pos[1] - self.extent[2]) / (self.extent[3] - self.extent[2])
             hx = (self.home[0] - self.extent[0]) / (self.extent[1] - self.extent[0])
             hy = (self.home[1] - self.extent[2]) / (self.extent[3] - self.extent[2])
-            bat = self.battery / self.spec.battery_km
+            bat = self.battery / self.spec.battery_h
         o = Observation(points=pts.unsqueeze(0), mask=torch.ones(1, pts.shape[0]),
                         belief_grid=grid.unsqueeze(0),
                         drone=torch.tensor([dx, dy, bat], dtype=torch.float32).unsqueeze(0))
         o.home = torch.tensor([hx, hy], dtype=torch.float32).unsqueeze(0)
+
+        # --- 기억 평면: 어디를 얼마나 오래전에 쟀고 무엇을 읽었나 ---
+        # 이게 없으면 문제가 마르코프가 아니다. 같은 지점을 다시 재는 게 유효한
+        # 전략인데(값이 오르면 그때 잡는다), 언제 뭘 쟀는지 모르면 판단할 수 없다.
+        rec = np.zeros((self.res, self.res), dtype=np.float32)
+        lastv = np.zeros((self.res, self.res), dtype=np.float32)
+        for gi, (ts, v) in self.last_seen.items():
+            gi_i, gi_j = self._si[gi], self._sj[gi]
+            age = max(0, self.t - ts)
+            rec[gi_i, gi_j] = float(np.exp(-age / 6.0))      # 최근일수록 1
+            lastv[gi_i, gi_j] = float(np.clip(v / self.spec.threshold, 0, 2))
+        mem = torch.tensor(np.stack([rec[np.ix_(ii, jj)], lastv[np.ix_(ii, jj)]]),
+                           dtype=torch.float32)
+        o.memory = mem.unsqueeze(0)
+
+        # --- 직전 위치 (왕복을 스스로 알아채게) ---
+        if self.prev_pos_km is None:
+            px, py = dx, dy
+        else:
+            px = (self.prev_pos_km[0] / (KM_PER_DEG_LAT * np.cos(self.latm))
+                  - self.extent[0]) / (self.extent[1] - self.extent[0])
+            py = (self.prev_pos_km[1] / KM_PER_DEG_LAT
+                  - self.extent[2]) / (self.extent[3] - self.extent[2])
+        o.prev = torch.tensor([float(px), float(py)], dtype=torch.float32).unsqueeze(0)
+
+        # --- 시각: 하루 주기 + 에피소드 경과 ---
+        hh = self.T[self.t].hour
+        o.time = torch.tensor([np.sin(2 * np.pi * hh / 24), np.cos(2 * np.pi * hh / 24),
+                               np.clip((self.t - self.t0) / 48.0, 0, 1)],
+                              dtype=torch.float32).unsqueeze(0)
         return o
 
 

@@ -39,8 +39,9 @@ def parse_args(argv=None):
     g.add_argument("--pollutant", default="PM10")
     g.add_argument("--threshold", type=float, default=80.0)
     g.add_argument("--hidden-ratio", type=float, default=0.35)
-    g.add_argument("--battery-km", type=float, default=400.0,
-                   help="드론 1대 왕복 예산. 250 이면 에피소드가 짧아 방문 지점이 적다")
+    g.add_argument("--battery-h", type=float, default=12.0,
+                   help="드론 1대의 비행 가능 시간. 한 수가 최소 1시간이므로 "
+                        "대략 이 값만큼의 스텝을 쓴다")
     g.add_argument("--speed-kmh", type=float, default=70.0)
     g.add_argument("--drones", type=int, default=3)
     g.add_argument("--event-prob", type=float, default=0.7,
@@ -120,12 +121,12 @@ def main(argv=None):
     table, coord = make_table(pollutant=a.pollutant)
     events = load_or_build(EventSpec(pollutant=a.pollutant, threshold=a.threshold))
     spec = SortieSpec(pollutant=a.pollutant, threshold=a.threshold,
-                      hidden_ratio=a.hidden_ratio, battery_km=a.battery_km,
+                      hidden_ratio=a.hidden_ratio, battery_h=a.battery_h,
                       speed_kmh=a.speed_kmh, n_drones=a.drones,
                       event_prob=a.event_prob)
     env = SortieEnv(canvas, table, coord, cfg, fmask, events, spec, seed=a.seed)
     print(f"[환경] 측정소 {table.shape[1]}개(은닉 {a.hidden_ratio:.0%}), "
-          f"사건 {len(env.events)}건, 배터리 {a.battery_km:.0f}km, 드론 {a.drones}대")
+          f"사건 {len(env.events)}건, 배터리 {a.battery_h:.0f}시간, 드론 {a.drones}대")
 
     net = GridMuZeroNet(cfg, channels=a.channels)
     print(f"[모델] 파라미터 {sum(p.numel() for p in net.parameters()):,}")
@@ -193,7 +194,10 @@ def main(argv=None):
                 prev_r = r; total += r
 
             n_ev = len(env.found)
-            hist.append((total, n_ev, len(env.visited_hidden), env.event_id))
+            n_site = len({g for g, _, _ in env.found})    # 서로 다른 지점 수
+            # 보상은 (지점,시각) 단위인데 평가지표는 사건 단위다. 한 사건에
+            # 눌러앉으면 n_ev 만 늘고 n_site 는 안 는다 — 그 차이를 보이게 둔다.
+            hist.append((total, n_ev, len(env.visited_hidden), env.event_id, n_site))
 
             if train and traj:
                 traj.append(dict(obs=obs, action=0, mask=traj[-1]["mask"],
@@ -228,8 +232,9 @@ def main(argv=None):
                     save(ep)
 
             rec = np.array([h[1] for h in hist[-20:]], dtype=float)
-            line = (f"  ep {ep:4d} | 보상 {total:6.3f} | 탐지 {n_ev} "
-                    f"(최근20 평균 {rec.mean():.2f}) | 방문 {len(env.visited_hidden)}곳")
+            line = (f"  ep {ep:4d} | 보상 {total:6.3f} | 탐지 {n_ev}"
+                    f"({n_site}지점) (최근20 평균 {rec.mean():.2f}) "
+                    f"| 방문 {len(env.visited_hidden)}곳")
             if train and last:
                 line += (f" | loss v {last['value']:.3f} r {last['reward']:.3f} "
                          f"p {last['policy']:.3f} | upd {n_upd}")
