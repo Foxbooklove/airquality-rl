@@ -1,8 +1,13 @@
 """출격 환경 학습 엔트리포인트 — 국지 고농도 사건 탐지.
 
-  python -m src.agent.train_sortie --episodes 200
-  python -m src.agent.train_sortie --baseline greedy --episodes 50 --no-train
-  python -m src.agent.train_sortie --load latest --episodes 100
+  python -m src.agent.train_sortie --episodes 0        # 무한, 이어서(기본)
+  python -m src.agent.train_sortie --episodes 0 --fresh # 바닥부터
+  python -m src.agent.train_sortie --baseline greedy --episodes 40
+
+체크포인트는 results/sortie/ 에 쌓인다:
+  ckpt_latest.pt      --save-every 마다 갱신. **기본으로 여기서 이어서 학습한다**
+  ckpt_ep000100.pt    --snapshot-every 마다 남는 되돌림 지점
+  incompatible_*.pt   구조가 바뀌어 못 읽은 옛 체크포인트 (덮어쓰지 않고 보관)
 
 기존 train.py 는 연속 행동 + 정보이득 경로다. 비교용으로 남겨두고 여기서
 새 경로(격자 이산 행동 + 사건 탐지)를 돌린다.
@@ -30,8 +35,16 @@ def parse_args(argv=None):
     g.add_argument("--baseline", choices=["none", "random", "greedy"], default="none",
                    help="학습 정책 대신 baseline 으로 굴린다 (비교용)")
     g.add_argument("--seed", type=int, default=0)
-    g.add_argument("--save-every", type=int, default=20)
-    g.add_argument("--load", default=None, help="'latest' | 파일경로")
+    g.add_argument("--save-every", type=int, default=20,
+                   help="이 에피소드마다 ckpt_latest.pt 갱신")
+    g.add_argument("--snapshot-every", type=int, default=100,
+                   help="이 에피소드마다 번호 붙은 사본을 따로 남긴다 (되돌릴 지점). "
+                        "0 이면 안 남김. 파일당 약 19MB")
+    g.add_argument("--load", default="latest",
+                   help="'latest' | 파일경로. **기본이 이어서 학습**이다 — "
+                        "끊었다 다시 켜는 일이 잦으므로 진행분을 보존하는 쪽을 기본으로 둔다")
+    g.add_argument("--fresh", action="store_true",
+                   help="체크포인트를 무시하고 바닥부터. 곡선을 깨끗하게 보고 싶을 때")
 
     g = p.add_argument_group("문제 설정")
     g.add_argument("--resolution", type=int, default=36)
@@ -135,16 +148,30 @@ def main(argv=None):
     mcts = GridMCTS(net, cfg, sims=a.sims)
 
     ep0 = 0
-    if a.load:
+    if a.load and not a.fresh:
         fp = OUT / "ckpt_latest.pt" if a.load == "latest" else Path(a.load)
-        blob = torch.load(fp, map_location="cpu", weights_only=False)
-        net.load_state_dict(blob["model"])
-        if opt is not None and blob.get("optim"):
-            opt.load_state_dict(blob["optim"])
-        ep0 = blob.get("episode", 0)
-        cfg.reward_scale = blob.get("reward_scale", 1.0)
-        print(f"[모델] 이어서: {fp.name} (누적 {ep0} 에피소드, "
-              f"reward_scale={cfg.reward_scale:.1f})")
+        if not fp.exists():
+            print(f"[모델] 체크포인트 없음 ({fp.name}) — 바닥부터 시작")
+        else:
+            # 구조가 바뀌면(예: 관측 평면 9->15) 옛 체크포인트를 못 읽는다.
+            # 기본이 자동 로드이므로, 조용히 깨지지 않게 크게 알리고 새로 시작한다.
+            blob = torch.load(fp, map_location="cpu", weights_only=False)
+            try:
+                net.load_state_dict(blob["model"])
+                if opt is not None and blob.get("optim"):
+                    opt.load_state_dict(blob["optim"])
+                ep0 = blob.get("episode", 0)
+                cfg.reward_scale = blob.get("reward_scale", 1.0)
+                print(f"[모델] 이어서: {fp.name} (누적 {ep0} 에피소드, "
+                      f"reward_scale={cfg.reward_scale:.2f})")
+            except Exception as e:
+                bak = fp.with_name(f"incompatible_ep{blob.get('episode', 0)}.pt")
+                fp.rename(bak)
+                print("=" * 66)
+                print(f"[경고] 체크포인트가 지금 모델 구조와 안 맞습니다 — 바닥부터 시작합니다.")
+                print(f"       {type(e).__name__}: {str(e)[:160]}")
+                print(f"       옛 파일은 {bak.name} 로 옮겨 두었습니다 (덮어쓰지 않음).")
+                print("=" * 66)
 
     buf = ReplayBuffer(capacity=a.replay, seed=a.seed)
     auto = str(a.reward_scale).lower() == "auto"
@@ -154,11 +181,19 @@ def main(argv=None):
     warm, hist, n_upd = [], [], 0
 
     def save(episode):
+        """ckpt_latest.pt 를 갱신하고, --snapshot-every 마다 번호 붙은 사본을 남긴다.
+
+        되돌릴 지점이 없으면 '어느 시점이 제일 좋았나' 를 나중에 확인할 수 없다.
+        용량이 파일당 약 19MB 라 100 에피소드마다면 감당할 만하다.
+        """
         if not train:
             return
-        torch.save({"model": net.state_dict(), "optim": opt.state_dict(),
-                    "episode": episode, "reward_scale": cfg.reward_scale,
-                    "hist": hist}, OUT / "ckpt_latest.pt")
+        blob = {"model": net.state_dict(), "optim": opt.state_dict(),
+                "episode": episode, "reward_scale": cfg.reward_scale,
+                "hist": hist}
+        torch.save(blob, OUT / "ckpt_latest.pt")
+        if a.snapshot_every > 0 and episode % a.snapshot_every == 0:
+            torch.save(blob, OUT / f"ckpt_ep{episode:06d}.pt")
 
     def episode_ids():
         """--episodes 0 이면 무한. 본문 들여쓰기를 건드리지 않으려고 생성자로 둔다."""
