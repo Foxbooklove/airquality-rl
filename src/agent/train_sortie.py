@@ -197,7 +197,9 @@ def main(argv=None):
             n_site = len({g for g, _, _ in env.found})    # 서로 다른 지점 수
             # 보상은 (지점,시각) 단위인데 평가지표는 사건 단위다. 한 사건에
             # 눌러앉으면 n_ev 만 늘고 n_site 는 안 는다 — 그 차이를 보이게 둔다.
-            hist.append((total, n_ev, len(env.visited_hidden), env.event_id, n_site))
+            n_evt = len(env.found_events)      # 서로 다른 '사건' 수 = 평가지표
+            hist.append((total, n_ev, len(env.visited_hidden), env.event_id,
+                         n_site, n_evt))
 
             if train and traj:
                 traj.append(dict(obs=obs, action=0, mask=traj[-1]["mask"],
@@ -231,10 +233,10 @@ def main(argv=None):
                 if ep % a.save_every == 0:
                     save(ep)
 
-            rec = np.array([h[1] for h in hist[-20:]], dtype=float)
-            line = (f"  ep {ep:4d} | 보상 {total:6.3f} | 탐지 {n_ev}"
-                    f"({n_site}지점) (최근20 평균 {rec.mean():.2f}) "
-                    f"| 방문 {len(env.visited_hidden)}곳")
+            rec = np.array([h[5] for h in hist[-20:]], dtype=float)   # 사건 기준
+            line = (f"  ep {ep:4d} | 보상 {total:6.3f} | 사건 {n_evt} "
+                    f"(최근20 평균 {rec.mean():.2f}) | 탐지 {n_ev}건 "
+                    f"{n_site}지점 | 방문 {len(env.visited_hidden)}곳")
             if train and last:
                 line += (f" | loss v {last['value']:.3f} r {last['reward']:.3f} "
                          f"p {last['policy']:.3f} | upd {n_upd}")
@@ -243,12 +245,18 @@ def main(argv=None):
         print("\n중단됨 — 지금까지 상태를 저장합니다")
 
     det = np.array([h[1] for h in hist], dtype=float)
+    site = np.array([h[4] for h in hist], dtype=float)
+    evt = np.array([h[5] for h in hist], dtype=float)
+    n = max(len(evt), 1)
     with_ev = [h for h in hist if h[3] >= 0]
-    print(f"\n[결과] {len(hist)} 에피소드  탐지 평균 {det.mean():.2f}건/에피소드")
+    # **사건**이 평가지표다. 탐지 건수는 (지점,시각) 단위라 한 곳에 눌러앉으면
+    # 부풀려진다 — 둘을 같이 찍어 그 차이가 보이게 한다.
+    print(f"\n[결과] {len(hist)} 에피소드")
+    print(f"  사건   {evt.mean():.2f} ± {evt.std()/np.sqrt(n):.2f} 건/에피소드  <- 평가지표")
+    print(f"  탐지   {det.mean():.2f}건 ({site.mean():.2f}지점)/에피소드")
     if with_ev:
-        hit = sum(1 for h in with_ev if h[1] > 0) / len(with_ev)
-        print(f"        사건 포함 에피소드 {len(with_ev)}개 중 "
-              f"{hit*100:.0f}% 에서 초과 지점을 찾음")
+        hit = sum(1 for h in with_ev if h[5] > 0) / len(with_ev)
+        print(f"  사건 포함 에피소드 {len(with_ev)}개 중 {hit*100:.0f}% 에서 그 사건을 탐지")
     if train:
         save(ep)
         print(f"[저장] {OUT / 'ckpt_latest.pt'}")

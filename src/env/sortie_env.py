@@ -113,6 +113,19 @@ class SortieEnv:
         self.events = self.events[ok].reset_index(drop=True)
         self._ev_start, self._ev_end = self._ev_start[ok], self._ev_end[ok]
 
+        # (측정소, 시각) -> 사건 id 조회표.
+        # 보상은 (지점, 시각) 단위지만 **평가지표는 사건 단위**다. 초과 중인 한
+        # 지점에 8시간 머물면 보상은 8건이지만 사건은 1건이다. 둘을 따로 센다.
+        name2i = {n: i for i, n in enumerate(self.names)}
+        self.ev_of: dict[tuple[int, int], int] = {}
+        for k in range(len(self.events)):
+            for st in self.events.stations.iloc[k]:
+                gi = name2i.get(st)
+                if gi is None:
+                    continue
+                for tt in range(int(self._ev_start[k]), int(self._ev_end[k]) + 1):
+                    self.ev_of[(gi, tt)] = k
+
         # 플랫폼 후보 = 본토 육지의 측정소 칸
         main = flight_mask.mainland_mask()
         self._si = np.clip(np.rint((self.slat - canvas.min_lat)
@@ -158,6 +171,7 @@ class SortieEnv:
         self.visited_hidden = set()        # 통계용 (보상 판정에는 안 씀)
         self.measured = set()              # (측정소idx, 시각idx) — 보상 중복 방지
         self.last_seen = {}                # 측정소idx -> (시각, 값). 관측 기억용
+        self.found_events = set()          # 탐지한 **사건** id — 이게 평가지표다
         self.prev_pos_km = None
 
         self._fit_variogram()
@@ -238,6 +252,9 @@ class SortieEnv:
                 r += s.w_detect
                 self.reward_terms["detect"] += s.w_detect
                 self.found.append((gi, self.t, float(val)))
+                k = self.ev_of.get((gi, self.t))
+                if k is not None:
+                    self.found_events.add(int(k))
             reward += r
 
         self._update_belief()
