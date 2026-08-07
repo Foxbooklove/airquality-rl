@@ -51,12 +51,25 @@ def parse_args(argv=None):
     g.add_argument("--mask-res", type=int, default=384)
     g.add_argument("--pollutant", default="PM10")
     g.add_argument("--threshold", type=float, default=80.0)
+    g.add_argument("--local-only", action="store_true",
+                   help="사건을 국지(전국평균 30~70분위)로 한정. 314건으로 줄지만 "
+                        "초과 커버리지가 1.1%%라 학습 신호가 극히 희소하다. "
+                        "기본은 광역 포함(1,565건, 커버리지 96.6%%)")
     g.add_argument("--hidden-ratio", type=float, default=0.35)
     g.add_argument("--battery-h", type=float, default=12.0,
                    help="드론 1대의 비행 가능 시간. 한 수가 최소 1시간이므로 "
                         "대략 이 값만큼의 스텝을 쓴다")
     g.add_argument("--speed-kmh", type=float, default=70.0)
     g.add_argument("--drones", type=int, default=3)
+    g.add_argument("--w-event", type=float, default=1.0,
+                   help="등록된 사건 최초 탐지 보상. 지표를 올리는 유일한 항")
+    g.add_argument("--w-repeat", type=float, default=0.1,
+                   help="같은 사건 재확인. 지표는 안 오르지만 근처라는 신호")
+    g.add_argument("--w-dense", type=float, default=0.0,
+                   help="측정값 크기 보상. 켜면 보상-지표 상관이 0.99 -> 0.47 로 "
+                        "떨어진다(측정). 기본 0")
+    g.add_argument("--dense-floor", type=float, default=0.5,
+                   help="조밀 항이 켜지는 하한 (임계 대비 비율)")
     g.add_argument("--event-prob", type=float, default=0.7,
                    help="에피소드를 사건 시각에서 시작할 확률. 1.0 이면 항상 사건이 "
                         "있다고 학습해 과잉탐지가 된다")
@@ -132,11 +145,18 @@ def main(argv=None):
     canvas = Canvas(region=None, resolution=a.resolution)
     fmask = FlightMask(canvas, resolution=a.mask_res)
     table, coord = make_table(pollutant=a.pollutant)
-    events = load_or_build(EventSpec(pollutant=a.pollutant, threshold=a.threshold))
+    espec = EventSpec(pollutant=a.pollutant, threshold=a.threshold,
+                      local_only=a.local_only)
+    events = load_or_build(espec)
+    n_loc = int(events.is_local.sum())
+    print(f"[사건] {len(events):,}건 (국지 {n_loc}, 광역·기타 {len(events)-n_loc})"
+          + ("  — 국지만" if a.local_only else ""))
     spec = SortieSpec(pollutant=a.pollutant, threshold=a.threshold,
                       hidden_ratio=a.hidden_ratio, battery_h=a.battery_h,
                       speed_kmh=a.speed_kmh, n_drones=a.drones,
-                      event_prob=a.event_prob)
+                      event_prob=a.event_prob, w_event=a.w_event,
+                      w_event_repeat=a.w_repeat, w_dense=a.w_dense,
+                      dense_floor=a.dense_floor)
     env = SortieEnv(canvas, table, coord, cfg, fmask, events, spec, seed=a.seed)
     print(f"[환경] 측정소 {table.shape[1]}개(은닉 {a.hidden_ratio:.0%}), "
           f"사건 {len(env.events)}건, 배터리 {a.battery_h:.0f}시간, 드론 {a.drones}대")
@@ -147,7 +167,9 @@ def main(argv=None):
     opt = torch.optim.Adam(net.parameters(), lr=a.lr) if train else None
     mcts = GridMCTS(net, cfg, sims=a.sims)
 
+    reward_sig = (a.w_event, a.w_repeat, a.w_dense, a.dense_floor, a.threshold)
     ep0 = 0
+    ep0_scale_stale = False
     if a.load and not a.fresh:
         fp = OUT / "ckpt_latest.pt" if a.load == "latest" else Path(a.load)
         if not fp.exists():
@@ -164,6 +186,13 @@ def main(argv=None):
                 cfg.reward_scale = blob.get("reward_scale", 1.0)
                 print(f"[모델] 이어서: {fp.name} (누적 {ep0} 에피소드, "
                       f"reward_scale={cfg.reward_scale:.2f})")
+                # 보상 정의가 바뀌면 저장된 스케일이 맞지 않는다. 가중치는
+                # 살리되 스케일만 다시 잡는다 — 안 그러면 가치 타깃이 통째로
+                # 어긋난다(예: 보상 평균 5.21 -> 0.21 로 바뀐 적이 있다).
+                if blob.get("reward_sig") != reward_sig:
+                    print(f"       [주의] 보상 정의가 바뀌었습니다 "
+                          f"— reward_scale 을 다시 측정합니다")
+                    ep0_scale_stale = True
             except Exception as e:
                 bak = fp.with_name(f"incompatible_ep{blob.get('episode', 0)}.pt")
                 fp.rename(bak)
@@ -173,11 +202,13 @@ def main(argv=None):
                 print(f"       옛 파일은 {bak.name} 로 옮겨 두었습니다 (덮어쓰지 않음).")
                 print("=" * 66)
 
+    if ep0_scale_stale:
+        ep0 = ep0                      # 가중치·에피소드는 유지, 스케일만 재측정
     buf = ReplayBuffer(capacity=a.replay, seed=a.seed)
     auto = str(a.reward_scale).lower() == "auto"
     if not auto:
         cfg.reward_scale = float(a.reward_scale)
-    scale_fixed = (not auto) or ep0 > 0
+    scale_fixed = (not auto) or (ep0 > 0 and not ep0_scale_stale)
     warm, hist, n_upd = [], [], 0
 
     def save(episode):
@@ -190,7 +221,7 @@ def main(argv=None):
             return
         blob = {"model": net.state_dict(), "optim": opt.state_dict(),
                 "episode": episode, "reward_scale": cfg.reward_scale,
-                "hist": hist}
+                "reward_sig": reward_sig, "hist": hist}
         torch.save(blob, OUT / "ckpt_latest.pt")
         if a.snapshot_every > 0 and episode % a.snapshot_every == 0:
             torch.save(blob, OUT / f"ckpt_ep{episode:06d}.pt")
@@ -233,8 +264,9 @@ def main(argv=None):
             # 보상은 (지점,시각) 단위인데 평가지표는 사건 단위다. 한 사건에
             # 눌러앉으면 n_ev 만 늘고 n_site 는 안 는다 — 그 차이를 보이게 둔다.
             n_evt = len(env.found_events)      # 서로 다른 '사건' 수 = 평가지표
+            n_loc_hit = sum(1 for k in env.found_events if env.ev_is_local.get(k))
             hist.append((total, n_ev, len(env.visited_hidden), env.event_id,
-                         n_site, n_evt))
+                         n_site, n_evt, n_loc_hit))
 
             if train and traj:
                 traj.append(dict(obs=obs, action=0, mask=traj[-1]["mask"],
@@ -250,7 +282,20 @@ def main(argv=None):
                         print(f"  ep {ep:4d} | 보상 {total:.3f} 탐지 {n_ev} "
                               f"[워밍업 {len(warm)}/{a.scale_warmup}]", flush=True)
                         continue
-                    med = float(np.median(np.abs(warm))) or 1.0
+                    # 보상이 희소해지면서 워밍업 대부분이 0 이 된다. 중앙값을
+                    # 쓰면 0 이 나와 스케일이 1.0 으로 굳는다 — 가치 타깃이
+                    # 너무 작아져 가치 헤드에 그래디언트가 안 간다(예전에 겪은 문제).
+                    # 0 이 아닌 리턴들의 평균을 쓰고, 그것도 없으면 계속 모은다.
+                    nz = [x for x in warm if abs(x) > 1e-9]
+                    if not nz:
+                        if len(warm) < a.scale_warmup * 8:
+                            print(f"  ep {ep:4d} | 보상 0 — 워밍업 연장 "
+                                  f"({len(warm)}판째, 0 아닌 리턴을 기다림)",
+                                  flush=True)
+                            continue
+                        med = float(np.mean(np.abs(warm))) or 1.0
+                    else:
+                        med = float(np.mean(np.abs(nz)))
                     cfg.reward_scale = 1.0 / med if med > 1e-9 else 1.0
                     scale_fixed = True
                     print(f"[스케일] 리턴 중앙값 {med:.4f} -> reward_scale="
@@ -287,7 +332,11 @@ def main(argv=None):
     # **사건**이 평가지표다. 탐지 건수는 (지점,시각) 단위라 한 곳에 눌러앉으면
     # 부풀려진다 — 둘을 같이 찍어 그 차이가 보이게 한다.
     print(f"\n[결과] {len(hist)} 에피소드")
+    loc = np.array([h[6] for h in hist], dtype=float)
     print(f"  사건   {evt.mean():.2f} ± {evt.std()/np.sqrt(n):.2f} 건/에피소드  <- 평가지표")
+    print(f"         그중 국지 {loc.mean():.2f}건 "
+          f"({loc.mean()/max(evt.mean(),1e-9)*100:.0f}%)  — 광역은 쉬운 문제라 "
+          f"국지 성능이 실질이다")
     print(f"  탐지   {det.mean():.2f}건 ({site.mean():.2f}지점)/에피소드")
     if with_ev:
         hit = sum(1 for h in with_ev if h[5] > 0) / len(with_ev)

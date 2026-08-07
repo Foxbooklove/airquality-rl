@@ -69,8 +69,21 @@ class SortieSpec:
     detect_radius_km: float = 20.0
     """격자 간격(전국 res=36 에서 약 19km)보다 작으면 대부분의 칸에서 측정이
     아예 불가능하다. 반경 8km 일 때 육지칸의 27%, 20km 면 약 70% 에서 측정된다."""
-    w_detect: float = 1.0          # 초과 발견 보상 (희소)
-    w_dense: float = 0.15          # 측정값 크기 보상 (조밀, 그래디언트용)
+    # --- 보상: 평가지표(사건 단위)에 맞춘다 ---
+    w_event: float = 1.0
+    """**등록된 사건**을 처음 탐지했을 때. 이게 유일하게 지표를 올리는 항이다."""
+    w_event_repeat: float = 0.1
+    """같은 사건을 다시 확인. 정보 가치는 있지만 지표는 안 올라가므로 작게."""
+    w_dense: float = 0.0
+    dense_floor: float = 0.5
+    """조밀 항은 **임계의 dense_floor 배 이상**에서만 켜진다.
+       r_dense = w_dense * max(0, val - floor*thr) / thr
+
+    예전엔 val/thr 을 그냥 줘서 평상시 PM10 15 를 재도 0.19 가 나왔다. 은닉
+    측정소를 30~38곳 방문하니 누적이 3.92 로 탐지분(1.30)을 압도했고, 결과적으로
+    정책이 배운 건 '아무 데나 많이 재라' 였다(측정: 보상 vs 지표 상관 r=0.029,
+    보상 vs 탐지건수 r=0.950). floor 를 두면 평상시 값은 0 이 되고 임계 근처에서만
+    방향을 준다."""
 
 
 class SortieEnv:
@@ -126,6 +139,15 @@ class SortieEnv:
                 for tt in range(int(self._ev_start[k]), int(self._ev_end[k]) + 1):
                     self.ev_of[(gi, tt)] = k
 
+        # 전국 평균의 연간 분포 — 관측에 '지금 전국이 얼마나 나쁜가' 를 준다.
+        # 사건 정의의 '국지' 조건이 전국 평균 분위에 달려 있는데, 이걸 안 주면
+        # 에이전트가 같은 초과를 잡고도 보상이 0 인지 1 인지 알 수 없다.
+        # 실무에서도 가시 측정소는 매시간 보고하므로 주어진 정보다.
+        self.nat = np.nanmean(self.A, axis=1)
+        self._nat_sorted = np.sort(self.nat[np.isfinite(self.nat)])
+        self.ev_is_local = {k: bool(self.events.is_local.iloc[k])
+                            for k in range(len(self.events))}
+
         # 플랫폼 후보 = 본토 육지의 측정소 칸
         main = flight_mask.mainland_mask()
         self._si = np.clip(np.rint((self.slat - canvas.min_lat)
@@ -176,7 +198,7 @@ class SortieEnv:
 
         self._fit_variogram()
         self._update_belief()
-        self.reward_terms = {"detect": 0.0, "dense": 0.0}
+        self.reward_terms = {"event": 0.0, "repeat": 0.0, "dense": 0.0}
         return self._obs()
 
     # ------------------------------------------------------------ 행동
@@ -246,15 +268,25 @@ class SortieEnv:
             self.measured.add((gi, self.t))
             self.visited_hidden.add(gi)
             self.last_seen[gi] = (self.t, float(val))
-            r = s.w_dense * float(np.clip(val / s.threshold, 0.0, 2.0))
+            v = float(val)
+            # 조밀 항 — 임계 근처에서만 방향을 준다 (평상시 값은 정확히 0)
+            r = s.w_dense * max(0.0, v - s.dense_floor * s.threshold) / s.threshold
             self.reward_terms["dense"] += r
-            if float(val) >= s.threshold:
-                r += s.w_detect
-                self.reward_terms["detect"] += s.w_detect
-                self.found.append((gi, self.t, float(val)))
+            if v >= s.threshold:
+                self.found.append((gi, self.t, v))
+                # **등록된 사건일 때만** 큰 보상. 지표가 사건 단위이므로
+                # 광역 오염 시간대의 초과나 1~2시간 스파이크를 잡아도 지표는
+                # 안 오른다 — 거기에 보상을 주면 지표와 무관한 걸 학습한다.
                 k = self.ev_of.get((gi, self.t))
-                if k is not None:
+                if k is None:
+                    pass
+                elif int(k) in self.found_events:
+                    r += s.w_event_repeat
+                    self.reward_terms["repeat"] += s.w_event_repeat
+                else:
                     self.found_events.add(int(k))
+                    r += s.w_event
+                    self.reward_terms["event"] += s.w_event
             reward += r
 
         self._update_belief()
@@ -366,8 +398,13 @@ class SortieEnv:
 
         # --- 시각: 하루 주기 + 에피소드 경과 ---
         hh = self.T[self.t].hour
+        # 전국 상황: 가시 측정소의 현재 평균과 그 연간 분위.
+        # 분위가 0.3~0.7 이면 '국지 사건이 성립하는 시간대' 라는 뜻이다.
+        cur = float(np.nanmean(row[vi])) if len(vi) else 0.0
+        pct = float(np.searchsorted(self._nat_sorted, cur) / max(len(self._nat_sorted), 1))
         o.time = torch.tensor([np.sin(2 * np.pi * hh / 24), np.cos(2 * np.pi * hh / 24),
-                               np.clip((self.t - self.t0) / 48.0, 0, 1)],
+                               np.clip((self.t - self.t0) / 48.0, 0, 1),
+                               np.clip(cur / self.spec.threshold, 0, 3), pct],
                               dtype=torch.float32).unsqueeze(0)
         return o
 

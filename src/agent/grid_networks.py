@@ -65,6 +65,8 @@ class GridRepresentation(nn.Module):
       11    **직전 위치** — 두 칸 왕복을 스스로 알아채게
       12,13 **시각** (하루 주기 sin/cos, 상수 평면)
       14    **에피소드 경과** (상수 평면)
+      15    **전국 평균 농도** (상수 평면)
+      16    **그 연간 분위** — 0.3~0.7 이면 국지 사건이 성립하는 시간대
 
     9~14 를 넣는 이유:
       보상이 (측정소, 시각) 단위라 같은 지점을 다시 재는 게 유효한 전략이다
@@ -74,7 +76,7 @@ class GridRepresentation(nn.Module):
       MuZero 원논문도 표현망에 최근 관측 + **최근 행동**을 함께 넣는다.
     """
 
-    N_PLANES = 15
+    N_PLANES = 17
 
     def __init__(self, cfg: ModelConfig, channels: int = 48, blocks: int = 3):
         super().__init__()
@@ -129,10 +131,11 @@ class GridRepresentation(nn.Module):
                       else torch.zeros(B, 1, G, G, device=dev))
         # --- 시각 (하루 주기 2 + 경과 1) ---
         tt = getattr(obs, "time", None)
+        n_t = 5                       # sin, cos, 경과, 전국평균, 전국분위
         if tt is None:
-            planes.append(torch.zeros(B, 3, G, G, device=dev))
+            planes.append(torch.zeros(B, n_t, G, G, device=dev))
         else:
-            planes.append(tt[:, :, None, None].expand(B, 3, G, G))
+            planes.append(tt[:, :, None, None].expand(B, n_t, G, G))
         return torch.cat(planes, dim=1)
 
     def forward(self, obs) -> torch.Tensor:
