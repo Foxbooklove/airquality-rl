@@ -313,10 +313,13 @@ def main(argv=None):
                 if ep % a.save_every == 0:
                     save(ep)
 
-            rec = np.array([h[5] for h in hist[-20:]], dtype=float)   # 사건 기준
-            line = (f"  ep {ep:4d} | 보상 {total:6.3f} | 사건 {n_evt} "
-                    f"(최근20 평균 {rec.mean():.2f}) | 탐지 {n_ev}건 "
-                    f"{n_site}지점 | 방문 {len(env.visited_hidden)}곳")
+            # 최근 50 이동평균으로 본다. 20 은 사건 발생이 성긴 탓에 너무 흔들린다.
+            w = hist[-50:]
+            rec = np.mean([h[5] for h in w])
+            rloc = np.mean([h[6] for h in w])
+            line = (f"  ep {ep:4d} | 사건 {rec:.2f} (국지 {rloc:.2f}) "
+                    f"| 이번 {n_evt}/{n_loc_hit} | 탐지 {n_ev}건 {n_site}지점 "
+                    f"| 방문 {len(env.visited_hidden)}곳")
             if train and last:
                 line += (f" | loss v {last['value']:.3f} r {last['reward']:.3f} "
                          f"p {last['policy']:.3f} | upd {n_upd}")
